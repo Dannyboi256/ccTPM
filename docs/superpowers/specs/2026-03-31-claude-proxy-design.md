@@ -30,20 +30,24 @@ Claude Code  ──HTTP──>  Proxy (localhost:8076)  ──HTTPS──>  api.
 
 `resp.Body` is a single `io.ReadCloser` — it cannot be read twice. To parse tokens without disrupting the stream to Claude Code, `ModifyResponse` replaces `resp.Body` with a custom wrapper:
 
-1. In `ModifyResponse`, wrap `resp.Body` with a tee-reader that duplicates all bytes to a side `io.Pipe`.
+1. In `ModifyResponse`, check `resp.StatusCode`. For non-2xx responses, skip tee-reader setup (no usage data to extract). For 2xx, wrap `resp.Body` with a custom `ReadCloser` that duplicates all bytes to a buffered channel.
 2. The proxy's normal copy loop reads the wrapper and forwards bytes to Claude Code as usual — no added latency.
-3. A background goroutine reads from the pipe and parses SSE events (or JSON for non-streaming) to extract token usage.
-4. When the stream ends (EOF), the goroutine sends the completed `RequestRecord` to the store.
+3. A background goroutine reads `[]byte` chunks from the buffered channel and parses SSE events (or JSON for non-streaming) to extract token usage.
+4. When the stream ends (EOF or error), the goroutine sends the completed `RequestRecord` to the store.
+
+**Why a buffered channel, not `io.Pipe`:** `io.Pipe` has zero internal buffering — if the parser goroutine falls behind (JSON unmarshalling, mutex contention, CPU scheduling), the pipe write blocks, which blocks the tee-reader's `Read()`, which stalls the response stream to Claude Code. A buffered channel (e.g., 64 chunks of up to 32KB each) decouples the two consumers so parser slowdowns never block the client stream.
 
 ```
 resp.Body (original)
     │
-    ├──> TeeReader wrapper ──> Claude Code (via proxy copy loop)
+    ├──> Custom ReadCloser ──> Claude Code (via proxy copy loop)
     │
-    └──> io.Pipe ──> parser goroutine ──> Stats Store
+    └──> buffered chan []byte ──> parser goroutine ──> Stats Store
 ```
 
-For non-streaming responses, the same tee-reader pattern applies — the parser goroutine simply reads the full JSON body instead of scanning for SSE events.
+**Cleanup on disconnect:** The custom `ReadCloser.Close()` method must close the buffered channel (signaling the parser goroutine to exit) and then close the original `resp.Body`. This handles both normal completion and abnormal termination (client disconnect, upstream reset). The parser goroutine must handle channel closure gracefully, recording a partial `RequestRecord` with whatever tokens were extracted so far, or discarding it if no usage data was received.
+
+For non-streaming responses, the same pattern applies — the parser goroutine simply reads the full JSON body from the channel instead of scanning for SSE events.
 
 ### Startup Flow
 
@@ -59,14 +63,16 @@ For non-streaming responses, the same tee-reader pattern applies — the parser 
 
 | Field          | Type          | Description                              |
 |----------------|---------------|------------------------------------------|
-| Timestamp      | time.Time     | When the request was sent                |
+| StartTime      | time.Time     | When the request was sent                |
+| EndTime        | time.Time     | When the response was fully received     |
 | Model          | string        | Model name from the response             |
 | InputTokens    | int           | `usage.input_tokens`                     |
 | OutputTokens   | int           | `usage.output_tokens` (includes thinking tokens) |
 | CacheCreation  | int           | `usage.cache_creation_input_tokens`      |
 | CacheRead      | int           | `usage.cache_read_input_tokens`          |
-| Latency        | time.Duration | Request sent to response fully received  |
 | Endpoint       | string        | e.g. `/v1/messages`                      |
+
+Latency is derived as `EndTime - StartTime`. Both timestamps are stored to support the merged-interval TPM calculation.
 
 Note: When extended thinking is enabled, thinking tokens are included in `output_tokens`. They are not broken out separately — this is intentionally out of scope for v1.
 
@@ -86,6 +92,7 @@ Note: When extended thinking is enabled, thinking tokens are included in `output
 | mu       | sync.RWMutex            | Protects concurrent access    |
 | sessions | map[string]*Session     | Keyed by session ID           |
 | inflight | map[uint64]InFlightReq  | In-flight requests keyed by auto-increment ID |
+| nextID   | atomic.Uint64           | Thread-safe ID generator for inflight map      |
 
 ### InFlightReq
 
@@ -99,15 +106,19 @@ Note: When extended thinking is enabled, thinking tokens are included in `output
 
 TPM measures throughput only when tokens are actively flowing. There is no inactivity threshold — active time is defined purely by request processing time.
 
-**Active time** = sum of completed request latencies + sum of in-flight request durations (updated each tick)
+**Active time** is computed as the **union of all request time intervals**, not the sum of individual durations. Each request has a `[startTime, endTime]` interval (in-flight requests use `now` as their end). Overlapping intervals are merged before summing their durations.
 
-**TPM** = `total_tokens / active_minutes`
+Example: two concurrent 30s requests over the same wall-clock window = 30s active time (not 60s). Two sequential 30s requests = 60s active time. This correctly reflects actual throughput regardless of concurrency.
 
-Where `active_minutes = active_time_duration.Minutes()`
+**Algorithm:**
+1. Collect all `[start, end]` intervals from completed requests (using their latency) and in-flight requests (using `now` as end).
+2. Sort intervals by start time.
+3. Merge overlapping intervals.
+4. Sum the durations of merged intervals = `active_time`.
 
-In-flight requests (sent but no response yet) contribute to active time in real-time. Once a response completes, that request's latency is locked in.
+**TPM** = `total_tokens / active_time.Minutes()`
 
-**Edge case:** If `active_minutes` is zero (no requests yet, or first tick), TPM is displayed as `--` in the TUI instead of computing a division by zero.
+**Edge case:** If `active_time` is zero (no requests yet, or first tick), TPM is displayed as `--` in the TUI instead of computing a division by zero.
 
 ## Response Parsing
 
@@ -151,7 +162,14 @@ Note: In `message_delta` events, `usage` is a top-level sibling of `delta`, not 
 - Extract `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` from `message_start` (these do not change during streaming).
 - Extract `output_tokens` from the final `message_delta` only (cumulative, supersedes any earlier values).
 
-The stream is forwarded to Claude Code in real-time via the tee-reader pattern — no buffering or added latency.
+**SSE error handling:** The Anthropic API can emit `event: error` events:
+```
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+```
+The parser must treat `event: error` as stream termination. Errored requests are discarded (no `RequestRecord` created) since they contain no meaningful token data. Additionally, `ModifyResponse` checks `resp.StatusCode` before setting up the tee-reader — non-2xx responses skip interception entirely.
+
+The stream is forwarded to Claude Code in real-time via the buffered channel pattern — no buffering or added latency on the client side.
 
 ## TUI Layout
 
