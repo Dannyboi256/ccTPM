@@ -193,6 +193,20 @@ func (s *Store) collectIntervals(sessionID string) []interval {
 	return intervals
 }
 
+// GetActiveTime returns the merged-interval active time for a specific session.
+// Returns 0 if the session doesn't exist or has no requests.
+func (s *Store) GetActiveTime(sessionID string) time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.sessions[sessionID]; !ok {
+		return 0
+	}
+	intervals := s.collectIntervals(sessionID)
+	merged := mergeIntervals(intervals)
+	return sumDurations(merged)
+}
+
 // CalculateTPM returns the TPM for a specific session.
 // Returns 0 if session doesn't exist or has no active time.
 func (s *Store) CalculateTPM(sessionID string) float64 {

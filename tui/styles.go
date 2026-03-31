@@ -5,10 +5,6 @@ import (
 )
 
 var (
-	titleStyle = lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("170"))
-
 	paneHeaderStyle = lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("39"))

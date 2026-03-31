@@ -130,8 +130,10 @@ func (m Model) renderSessionPane(sess *store.Session, inflight map[uint64]store.
 		sessionLabel = fmt.Sprintf("%s [%d/%d]", m.currentSession, m.sessionIdx+1, len(m.sessionList))
 	}
 
+	activeTime := m.store.GetActiveTime(m.currentSession)
+	activeStr := formatDuration(activeTime)
 	b.WriteString(paneHeaderStyle.Render(fmt.Sprintf(" Session: %s ", sessionLabel)))
-	b.WriteString(statLabelStyle.Render(fmt.Sprintf("  Uptime: %s", uptime)))
+	b.WriteString(statLabelStyle.Render(fmt.Sprintf("  Duration: %s (active: %s)", uptime, activeStr)))
 	b.WriteString("\n")
 
 	var inputTok, outputTok, cacheRead, cacheCreate, reqCount int
@@ -267,6 +269,13 @@ func (m Model) renderAggregatePane() string {
 	return aggregateStyle.Width(maxInt(m.width-2, 60)).Render(
 		paneHeaderStyle.Render(" Aggregate (All Sessions) ") + "\n" + b.String(),
 	)
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dm %02ds", m, s)
 }
 
 func formatNum(n int) string {
