@@ -30,6 +30,7 @@ func main() {
 	to := flag.String("to", "", "End time filter for queries")
 	last := flag.String("last", "", "Relative time filter (e.g., 24h, 7d)")
 	ttftThreshold := flag.Int("ttft-threshold", 5000, "TTFT threshold in ms for throttle queries")
+	limit := flag.Int("limit", 10, "Max rows to return in query mode (0 = unlimited)")
 	flag.Parse()
 
 	// Resolve --last to --from
@@ -59,6 +60,7 @@ func main() {
 			From:          *from,
 			To:            *to,
 			TTFTThreshold: *ttftThreshold,
+			Limit:         *limit,
 			SessionID:     sessionFilter,
 		})
 		if err != nil {

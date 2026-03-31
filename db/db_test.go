@@ -44,7 +44,7 @@ func TestInsertAndQueryRequests(t *testing.T) {
 		t.Fatalf("InsertRecord failed: %v", err)
 	}
 
-	rows, err := d.QueryRequests("", "", "")
+	rows, err := d.QueryRequests("", "", "", 0)
 	if err != nil {
 		t.Fatalf("QueryRequests failed: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestQuerySessions(t *testing.T) {
 		SessionID: "sess2", StatusCode: 200,
 	})
 
-	sessions, err := d.QuerySessions()
+	sessions, err := d.QuerySessions(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestQueryThrottle(t *testing.T) {
 		StatusCode: 200, SessionID: "s1", TTFT: 6 * time.Second,
 	})
 
-	rows, err := d.QueryThrottle(5000, "", "", "")
+	rows, err := d.QueryThrottle(5000, "", "", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

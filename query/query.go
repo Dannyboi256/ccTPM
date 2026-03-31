@@ -14,6 +14,7 @@ type Opts struct {
 	To            string
 	SessionID     string
 	TTFTThreshold int
+	Limit         int
 	Writer        io.Writer
 }
 
@@ -25,7 +26,7 @@ func RunQuery(d *db.DB, queryType string, opts Opts) error {
 
 	switch queryType {
 	case "sessions":
-		return runSessions(d, w)
+		return runSessions(d, w, opts.Limit)
 	case "requests":
 		return runRequests(d, w, opts)
 	case "throttle":
@@ -37,8 +38,8 @@ func RunQuery(d *db.DB, queryType string, opts Opts) error {
 	}
 }
 
-func runSessions(d *db.DB, w io.Writer) error {
-	sessions, err := d.QuerySessions()
+func runSessions(d *db.DB, w io.Writer, limit int) error {
+	sessions, err := d.QuerySessions(limit)
 	if err != nil {
 		return err
 	}
@@ -54,7 +55,7 @@ func runSessions(d *db.DB, w io.Writer) error {
 }
 
 func runRequests(d *db.DB, w io.Writer, opts Opts) error {
-	rows, err := d.QueryRequests(opts.From, opts.To, opts.SessionID)
+	rows, err := d.QueryRequests(opts.From, opts.To, opts.SessionID, opts.Limit)
 	if err != nil {
 		return err
 	}
@@ -75,7 +76,7 @@ func runThrottle(d *db.DB, w io.Writer, opts Opts) error {
 	if threshold == 0 {
 		threshold = 5000
 	}
-	rows, err := d.QueryThrottle(threshold, opts.From, opts.To, opts.SessionID)
+	rows, err := d.QueryThrottle(threshold, opts.From, opts.To, opts.SessionID, opts.Limit)
 	if err != nil {
 		return err
 	}

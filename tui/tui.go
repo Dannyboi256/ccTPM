@@ -193,7 +193,8 @@ func (m Model) renderRequestLog(sess *store.Session, inflight map[uint64]store.I
 	}
 
 	if sess != nil {
-		for i := len(sess.Requests) - 1; i >= 0; i-- {
+		startIdx := maxInt(0, len(sess.Requests)-10)
+		for i := len(sess.Requests) - 1; i >= startIdx; i-- {
 			r := sess.Requests[i]
 			latency := r.EndTime.Sub(r.StartTime).Truncate(100 * time.Millisecond)
 

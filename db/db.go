@@ -95,7 +95,7 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-func (d *DB) QueryRequests(from, to, sessionID string) ([]store.RequestRecord, error) {
+func (d *DB) QueryRequests(from, to, sessionID string, limit int) ([]store.RequestRecord, error) {
 	q := "SELECT session_id, start_time, end_time, model, endpoint, status_code, input_tokens, output_tokens, cache_creation, cache_read, ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error FROM requests WHERE 1=1"
 	var args []any
 	if from != "" {
@@ -111,6 +111,9 @@ func (d *DB) QueryRequests(from, to, sessionID string) ([]store.RequestRecord, e
 		args = append(args, sessionID)
 	}
 	q += " ORDER BY start_time DESC"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
 
 	rows, err := d.conn.Query(q, args...)
 	if err != nil {
@@ -120,17 +123,19 @@ func (d *DB) QueryRequests(from, to, sessionID string) ([]store.RequestRecord, e
 	return scanRecords(rows)
 }
 
-func (d *DB) QuerySessions() ([]SessionSummary, error) {
-	rows, err := d.conn.Query(`
-		SELECT session_id,
-			COUNT(*) as request_count,
-			SUM(input_tokens + output_tokens + cache_creation + cache_read) as total_tokens,
-			MIN(start_time) as first_seen,
-			MAX(end_time) as last_seen
+func (d *DB) QuerySessions(limit int) ([]SessionSummary, error) {
+	q := `SELECT session_id,
+		COUNT(*) as request_count,
+		SUM(input_tokens + output_tokens + cache_creation + cache_read) as total_tokens,
+		MIN(start_time) as first_seen,
+		MAX(end_time) as last_seen
 		FROM requests
 		GROUP BY session_id
-		ORDER BY last_seen DESC
-	`)
+		ORDER BY last_seen DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := d.conn.Query(q)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +155,7 @@ func (d *DB) QuerySessions() ([]SessionSummary, error) {
 	return sessions, rows.Err()
 }
 
-func (d *DB) QueryThrottle(ttftThresholdMs int, from, to, sessionID string) ([]store.RequestRecord, error) {
+func (d *DB) QueryThrottle(ttftThresholdMs int, from, to, sessionID string, limit int) ([]store.RequestRecord, error) {
 	q := `SELECT session_id, start_time, end_time, model, endpoint, status_code,
 		input_tokens, output_tokens, cache_creation, cache_read,
 		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error
@@ -169,6 +174,9 @@ func (d *DB) QueryThrottle(ttftThresholdMs int, from, to, sessionID string) ([]s
 		args = append(args, sessionID)
 	}
 	q += " ORDER BY start_time DESC"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
 
 	rows, err := d.conn.Query(q, args...)
 	if err != nil {
