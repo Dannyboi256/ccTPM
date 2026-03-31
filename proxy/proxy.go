@@ -3,7 +3,9 @@ package proxy
 import (
 	"claude-proxy/parser"
 	"claude-proxy/store"
+	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -12,6 +14,10 @@ import (
 	"sync"
 	"time"
 )
+
+type contextKey string
+
+const requestStartKey contextKey = "requestStart"
 
 type teeReadCloser struct {
 	original         io.ReadCloser
@@ -104,6 +110,8 @@ func NewProxy(cfg Config) *httputil.ReverseProxy {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(cfg.UpstreamURL)
 			pr.Out.Host = cfg.UpstreamURL.Host
+			ctx := context.WithValue(pr.Out.Context(), requestStartKey, time.Now())
+			pr.Out = pr.Out.WithContext(ctx)
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			return modifyResponse(resp, cfg)
@@ -115,7 +123,10 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 	req := resp.Request
 	sessionID := ExtractSessionID(req.Header, cfg.SessionName)
 	endpoint := req.URL.Path
-	requestStart := time.Now()
+	requestStart, _ := req.Context().Value(requestStartKey).(time.Time)
+	if requestStart.IsZero() {
+		requestStart = time.Now()
+	}
 	retryAfter, reqRemaining, tokRemaining := extractRateLimitHeaders(resp)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -133,6 +144,7 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 		select {
 		case cfg.DBChan <- rec:
 		default:
+			log.Println("warning: DB write channel full, record dropped")
 		}
 		return nil
 	}
@@ -180,6 +192,7 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 		select {
 		case cfg.DBChan <- rec:
 		default:
+			log.Println("warning: DB write channel full, record dropped")
 		}
 	}()
 
