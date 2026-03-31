@@ -112,6 +112,9 @@ func NewProxy(cfg Config) *httputil.ReverseProxy {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(cfg.UpstreamURL)
 			pr.Out.Host = cfg.UpstreamURL.Host
+			// Restrict to gzip only — we decompress in the parser goroutine.
+			// Prevents brotli/deflate responses we can't decode.
+			pr.Out.Header.Set("Accept-Encoding", "gzip")
 			ctx := context.WithValue(pr.Out.Context(), requestStartKey, time.Now())
 			pr.Out = pr.Out.WithContext(ctx)
 		},

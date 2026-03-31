@@ -66,6 +66,7 @@ type sseMessageDelta struct {
 func ParseSSE(r io.Reader) (Result, error) {
 	var result Result
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 256*1024), 2*1024*1024) // 2MB max line for extended thinking deltas
 	var currentEvent string
 
 	for scanner.Scan() {
