@@ -34,7 +34,7 @@ func main() {
 
 	// Resolve --last to --from
 	if *last != "" && *from == "" {
-		dur, err := time.ParseDuration(*last)
+		dur, err := parseDuration(*last)
 		if err != nil {
 			log.Fatalf("invalid --last value: %v", err)
 		}
@@ -54,6 +54,7 @@ func main() {
 			From:          *from,
 			To:            *to,
 			TTFTThreshold: *ttftThreshold,
+			SessionID:     *session,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -111,7 +112,7 @@ func main() {
 	}()
 
 	// Set up debug logging for bubbletea
-	f, err := tea.LogToFile("claude-proxy-debug.log", "claude-proxy")
+	f, err := tea.LogToFile(filepath.Join(filepath.Dir(*dbPath), "debug.log"), "claude-proxy")
 	if err != nil {
 		log.Fatalf("log to file: %v", err)
 	}
@@ -144,4 +145,17 @@ func defaultDBPath() string {
 		return "claude-proxy-data.db"
 	}
 	return filepath.Join(home, ".claude-proxy", "data.db")
+}
+
+// parseDuration extends time.ParseDuration to support the "d" (days) suffix.
+// "7d" is converted to 7*24h before parsing.
+func parseDuration(s string) (time.Duration, error) {
+	if len(s) > 1 && s[len(s)-1] == 'd' {
+		var days int
+		if _, err := fmt.Sscanf(s[:len(s)-1], "%d", &days); err != nil {
+			return 0, fmt.Errorf("invalid day value in %q: %w", s, err)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
 }
