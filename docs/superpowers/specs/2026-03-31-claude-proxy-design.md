@@ -41,7 +41,19 @@ Claude Code  ──HTTP──>  Proxy (localhost:8076)  ──HTTPS──>  api.
 
 `resp.Body` is a single `io.ReadCloser` — it cannot be read twice. To parse tokens without disrupting the stream to Claude Code, `ModifyResponse` replaces `resp.Body` with a custom wrapper:
 
-1. In `ModifyResponse`, extract response headers (`Retry-After`, `x-ratelimit-requests-remaining`, `x-ratelimit-tokens-remaining`) and `resp.StatusCode`. For non-2xx responses, record a `RequestRecord` with status code, headers, and zero tokens (no tee-reader needed — persist for throttling analysis). For 2xx, determine the parsing mode from `resp.Header.Get("Content-Type")`: `text/event-stream` → SSE parser, otherwise → JSON parser. Pass the parsing mode to the parser goroutine. Then wrap `resp.Body` with a custom `ReadCloser` that records the timestamp of the first `Read()` call (TTFT) and duplicates all bytes to a buffered channel.
+1. In `ModifyResponse`, extract response headers (`Retry-After`, `x-ratelimit-requests-remaining`, `x-ratelimit-tokens-remaining`) and `resp.StatusCode`. For non-2xx responses, `ModifyResponse` creates a `RequestRecord` directly with status code, rate-limit headers, TTFT=0, model="" (unknown), zero tokens, and sends it to both the in-memory store and the DB write channel. No tee-reader or parser goroutine is involved. The TUI displays these errored requests in the request log (marked with status code) for throttle visibility. For 2xx, determine the parsing mode from `resp.Header.Get("Content-Type")`: `text/event-stream` → SSE parser, otherwise → JSON parser. Pass the parsing mode to the parser goroutine. Then wrap `resp.Body` with a custom `ReadCloser` that measures TTFT and duplicates all bytes to a buffered channel. TTFT is measured as `time.Since(requestStartTime)` captured when the first `Read()` call *returns with n > 0 bytes* (not when `Read()` is called). This captures the actual moment data arrives from upstream, not when the proxy's copy loop requests it.
+
+```go
+func (r *teeReadCloser) Read(p []byte) (int, error) {
+    n, err := r.original.Read(p)
+    if n > 0 && !r.ttftRecorded {
+        r.ttft = time.Since(r.requestStartTime)
+        r.ttftRecorded = true
+    }
+    // ... send copy to channel ...
+    return n, err
+}
+```
 2. The proxy's normal copy loop reads the wrapper and forwards bytes to Claude Code as usual — no added latency.
 3. A background goroutine reads `[]byte` chunks from the buffered channel and parses SSE events (or JSON for non-streaming) to extract token usage.
 4. When the stream ends (EOF or error), the goroutine sends the completed `RequestRecord` to the store.
@@ -83,7 +95,7 @@ For non-streaming responses, the same pattern applies — the parser goroutine s
 | CacheRead      | int           | `usage.cache_read_input_tokens`          |
 | Endpoint       | string        | e.g. `/v1/messages`                      |
 | StatusCode     | int           | HTTP response status (200, 429, 529, etc.) |
-| TTFT           | time.Duration | Time-to-first-token: request sent → first byte of response body received. Key throttling signal — API may accept but delay generation. |
+| TTFT           | time.Duration | Time-to-first-token: request sent → first `Read()` returning data. Key throttling signal — API may accept but delay generation. |
 | RetryAfter     | string        | `Retry-After` header value if present (empty otherwise) |
 | RateLimitReqRemaining | int   | `x-ratelimit-requests-remaining` header if present (-1 otherwise) |
 | RateLimitTokRemaining | int   | `x-ratelimit-tokens-remaining` header if present (-1 otherwise) |
@@ -304,8 +316,8 @@ CREATE TABLE requests (
     session_id    TEXT NOT NULL,
     start_time    DATETIME NOT NULL,
     end_time      DATETIME NOT NULL,
-    model         TEXT NOT NULL,
-    endpoint      TEXT NOT NULL,
+    model         TEXT NOT NULL DEFAULT '',
+    endpoint      TEXT NOT NULL DEFAULT '',
     status_code   INTEGER NOT NULL,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -314,20 +326,31 @@ CREATE TABLE requests (
     ttft_ms       INTEGER NOT NULL DEFAULT 0,
     retry_after   TEXT NOT NULL DEFAULT '',
     ratelimit_req_remaining INTEGER NOT NULL DEFAULT -1,
-    ratelimit_tok_remaining INTEGER NOT NULL DEFAULT -1
+    ratelimit_tok_remaining INTEGER NOT NULL DEFAULT -1,
+    has_error     INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX idx_requests_session ON requests(session_id);
+CREATE INDEX idx_requests_session_time ON requests(session_id, start_time);
 CREATE INDEX idx_requests_start_time ON requests(start_time);
-CREATE INDEX idx_requests_model ON requests(model);
-CREATE INDEX idx_requests_status_code ON requests(status_code);
+CREATE INDEX idx_requests_status_code_time ON requests(status_code, start_time);
 ```
 
 ### Write behavior
 
-- Each completed `RequestRecord` is inserted into the database asynchronously via a buffered channel (separate from the parser channel) to avoid blocking the proxy.
+- Each completed `RequestRecord` is inserted into the database asynchronously via a buffered channel (capacity: 256 records) separate from the parser channel. Since the writer is the store goroutine (which has already finished serving the HTTP response), blocking on a full channel does not add client-visible latency.
+- A single DB writer goroutine reads from this channel and executes inserts.
 - Writes use WAL mode for concurrent read/write without locking the TUI's reads.
 - Errored requests (non-2xx) are also persisted — their `status_code` and `ttft_ms` are valuable for throttling analysis even without token data.
+- SSE streams that terminate with `event: error` are persisted with status_code 200, zero tokens, and `has_error = true` (see schema).
+
+### Shutdown drain
+
+On shutdown, after all in-flight HTTP requests complete:
+1. Close the DB write channel.
+2. The DB writer goroutine drains all remaining records from the channel.
+3. Close the database connection.
+
+This sequence is added to the end of the Startup Flow shutdown step (step 5).
 
 ### Startup behavior
 
@@ -345,12 +368,20 @@ claude-proxy --query sessions
 # Show requests in a time range
 claude-proxy --query requests --from "2026-03-30 09:00" --to "2026-03-30 17:00"
 
-# Show throttling events (429s and high TTFT)
+# Show throttling events
 claude-proxy --query throttle
+claude-proxy --query throttle --ttft-threshold 5000  # custom TTFT threshold in ms
 
 # Show summary stats
 claude-proxy --query summary --last 24h
 ```
+
+**`--query throttle` criteria:**
+- HTTP status 429 (rate limited) or 529 (overloaded)
+- Requests with `has_error = 1` (SSE error events, e.g., `overloaded_error` — these have status 200 but represent server-side throttling)
+- Requests where `ttft_ms` exceeds the threshold (default: 5000ms, configurable via `--ttft-threshold`)
+
+All three criteria are OR'd — any match is shown. Output includes timestamp, session, model, status code, TTFT, rate-limit headers, and error flag.
 
 Query output is formatted as a table to stdout. The database file can also be queried directly with any SQLite client (`sqlite3 ~/.claude-proxy/data.db`).
 
@@ -370,5 +401,6 @@ Cost estimation is explicitly out of scope.
 | `--from`     | (none)                          | Start time filter for queries |
 | `--to`       | (none)                          | End time filter for queries |
 | `--last`     | (none)                          | Relative time filter (e.g., `24h`, `7d`) |
+| `--ttft-threshold` | `5000`                    | TTFT threshold in ms for `--query throttle` |
 
 When `--query` is provided, the proxy does not start — it runs the query against the database and exits.
