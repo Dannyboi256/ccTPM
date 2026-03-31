@@ -21,7 +21,7 @@ Claude Code  ──HTTP──>  Proxy (localhost:8076)  ──HTTPS──>  api.
 
 ### Components
 
-1. **Reverse Proxy** — `httputil.ReverseProxy` using `Rewrite` (not `Director`) to forward to `https://api.anthropic.com`. Uses `ModifyResponse` to set up response body interception (see Streaming Architecture below).
+1. **Reverse Proxy** — `httputil.ReverseProxy` using `Rewrite` (not `Director`) to forward to `https://api.anthropic.com`. Request bodies are forwarded unmodified — the proxy does not read or inspect request bodies. Uses `ModifyResponse` to set up response body interception (see Streaming Architecture below).
 
    **Why `Rewrite` over `Director`:** With `Director`, a `Connection: x-api-key` header could cause Go's ReverseProxy to strip the API key as a hop-by-hop header, breaking authentication. `Rewrite` (Go 1.20+) is the recommended API and avoids this class of issues. Configuration:
    ```go
@@ -41,7 +41,7 @@ Claude Code  ──HTTP──>  Proxy (localhost:8076)  ──HTTPS──>  api.
 
 `resp.Body` is a single `io.ReadCloser` — it cannot be read twice. To parse tokens without disrupting the stream to Claude Code, `ModifyResponse` replaces `resp.Body` with a custom wrapper:
 
-1. In `ModifyResponse`, check `resp.StatusCode`. For non-2xx responses, skip tee-reader setup (no usage data to extract). For 2xx, wrap `resp.Body` with a custom `ReadCloser` that duplicates all bytes to a buffered channel.
+1. In `ModifyResponse`, check `resp.StatusCode`. For non-2xx responses, skip tee-reader setup (no usage data to extract). For 2xx, determine the parsing mode from `resp.Header.Get("Content-Type")`: `text/event-stream` → SSE parser, otherwise → JSON parser. Pass the parsing mode to the parser goroutine. Then wrap `resp.Body` with a custom `ReadCloser` that duplicates all bytes to a buffered channel.
 2. The proxy's normal copy loop reads the wrapper and forwards bytes to Claude Code as usual — no added latency.
 3. A background goroutine reads `[]byte` chunks from the buffered channel and parses SSE events (or JSON for non-streaming) to extract token usage.
 4. When the stream ends (EOF or error), the goroutine sends the completed `RequestRecord` to the store.
@@ -208,6 +208,10 @@ The stream is forwarded to Claude Code in real-time via the buffered channel pat
 - `tab` — cycle between sessions
 - `j`/`k` — scroll the request log
 
+### Session Selection
+
+The TUI maintains an ordered session list sorted by `LastSeen` (most recently active first). On startup, the current session defaults to the `--session` flag value (or `"default"`). `tab` cycles through sessions in this order. New sessions appearing mid-use are added to the list but do not change the current selection.
+
 ### Refresh
 
 TUI redraws on a 1-second tick.
@@ -242,6 +246,8 @@ If none are found, requests are grouped under a `"default"` session.
 **Note:** Claude Code may not currently send session ID headers. These header names are aspirational and will be verified empirically during development. As a practical fallback, a `--session` CLI flag allows the user to manually name the session when starting the proxy. Multiple proxy instances (each with a different `--session` name) can run on different ports to track separate Claude Code sessions.
 
 ## Project Structure
+
+Module path: `claude-proxy` (local tool, not published to a registry).
 
 ```
 claude-proxy/
