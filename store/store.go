@@ -66,6 +66,20 @@ func (s *Store) AddRecord(rec RequestRecord) {
 	}
 	sess.LastSeen = rec.EndTime
 	sess.Requests = append(sess.Requests, rec)
+	if len(sess.Requests) > 1000 {
+		sess.Requests = sess.Requests[len(sess.Requests)-1000:]
+	}
+}
+
+func (s *Store) Prune(maxAge time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-maxAge)
+	for id, sess := range s.sessions {
+		if sess.LastSeen.Before(cutoff) {
+			delete(s.sessions, id)
+		}
+	}
 }
 
 func (s *Store) GetSession(id string) *Session {

@@ -99,6 +99,17 @@ func main() {
 		}
 	}()
 
+	// Periodically prune stale sessions from in-memory store
+	pruneDone := make(chan struct{})
+	go func() {
+		defer close(pruneDone)
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			st.Prune(1 * time.Hour)
+		}
+	}()
+
 	p := proxy.NewProxy(proxy.Config{
 		UpstreamURL: upstreamURL,
 		SessionName: *session,
@@ -136,7 +147,9 @@ func main() {
 	// 1. Graceful HTTP shutdown (wait for in-flight requests)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
 
 	// 2. Close DB write channel and drain
 	close(dbChan)

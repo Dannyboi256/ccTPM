@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,8 +25,7 @@ type teeReadCloser struct {
 	original         io.ReadCloser
 	ch               chan []byte
 	requestStartTime time.Time
-	ttft             time.Duration
-	ttftRecorded     bool
+	ttftNs           atomic.Int64
 	closeOnce        sync.Once
 }
 
@@ -40,17 +40,10 @@ func newTeeReadCloser(original io.ReadCloser, ch chan []byte, requestStart time.
 func (r *teeReadCloser) Read(p []byte) (int, error) {
 	n, err := r.original.Read(p)
 	if n > 0 {
-		if !r.ttftRecorded {
-			r.ttft = time.Since(r.requestStartTime)
-			r.ttftRecorded = true
-		}
+		r.ttftNs.CompareAndSwap(0, int64(time.Since(r.requestStartTime)))
 		cp := make([]byte, n)
 		copy(cp, p[:n])
-		select {
-		case r.ch <- cp:
-		default:
-			log.Println("warning: parser channel full, data chunk dropped")
-		}
+		r.ch <- cp
 	}
 	if err != nil {
 		r.closeChannel()
@@ -70,7 +63,7 @@ func (r *teeReadCloser) closeChannel() {
 }
 
 func (r *teeReadCloser) TTFT() time.Duration {
-	return r.ttft
+	return time.Duration(r.ttftNs.Load())
 }
 
 func ExtractSessionID(headers http.Header, fallback string) string {
@@ -173,6 +166,19 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 				// drain channel so tee-reader never blocks
 				for range ch {
 				}
+				rec := store.RequestRecord{
+					StartTime:             requestStart,
+					EndTime:               time.Now(),
+					Endpoint:              endpoint,
+					StatusCode:            resp.StatusCode,
+					RetryAfter:            retryAfter,
+					RateLimitReqRemaining: reqRemaining,
+					RateLimitTokRemaining: tokRemaining,
+					HasError:              true,
+					SessionID:             sessionID,
+				}
+				cfg.Store.AddRecord(rec)
+				cfg.DBChan <- rec
 				return
 			}
 			defer gz.Close()

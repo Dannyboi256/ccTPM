@@ -218,9 +218,6 @@ func (m Model) renderRequestLog(sess *store.Session, inflight map[uint64]store.I
 		}
 	}
 
-	if m.scrollOffset >= len(rows) && len(rows) > 0 {
-		// clamp but don't modify m (value receiver)
-	}
 	offset := m.scrollOffset
 	if offset >= len(rows) {
 		offset = maxInt(len(rows)-1, 0)

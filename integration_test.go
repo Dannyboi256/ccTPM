@@ -15,6 +15,19 @@ import (
 	"time"
 )
 
+func waitForSession(t *testing.T, st *store.Store, sessionID string, timeout time.Duration) *store.Session {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if sess := st.GetSession(sessionID); sess != nil && len(sess.Requests) > 0 {
+			return sess
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for session %q", sessionID)
+	return nil
+}
+
 func TestProxyForwardsAndCapturesTokens(t *testing.T) {
 	// Mock upstream returns JSON with usage
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,12 +81,7 @@ func TestProxyForwardsAndCapturesTokens(t *testing.T) {
 		t.Fatalf("response body not forwarded")
 	}
 
-	time.Sleep(100 * time.Millisecond) // Wait for parser goroutine
-
-	sess := st.GetSession("test")
-	if sess == nil {
-		t.Fatal("no session found")
-	}
+	sess := waitForSession(t, st, "test", 2*time.Second)
 	if len(sess.Requests) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(sess.Requests))
 	}
@@ -125,12 +133,7 @@ func TestProxyHandlesSSEStream(t *testing.T) {
 	io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	time.Sleep(200 * time.Millisecond)
-
-	sess := st.GetSession("sse-test")
-	if sess == nil {
-		t.Fatal("no session")
-	}
+	sess := waitForSession(t, st, "sse-test", 2*time.Second)
 	if len(sess.Requests) != 1 {
 		t.Fatalf("expected 1, got %d", len(sess.Requests))
 	}
@@ -176,12 +179,7 @@ func TestProxyHandles429(t *testing.T) {
 		t.Fatalf("expected 429, got %d", resp.StatusCode)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	sess := st.GetSession("throttle-test")
-	if sess == nil {
-		t.Fatal("no session")
-	}
+	sess := waitForSession(t, st, "throttle-test", 2*time.Second)
 	r := sess.Requests[0]
 	if r.StatusCode != 429 {
 		t.Fatalf("expected 429, got %d", r.StatusCode)
@@ -230,12 +228,7 @@ func TestProxyHandlesGzipSSEStream(t *testing.T) {
 	io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	time.Sleep(200 * time.Millisecond)
-
-	sess := st.GetSession("gzip-test")
-	if sess == nil {
-		t.Fatal("no session")
-	}
+	sess := waitForSession(t, st, "gzip-test", 2*time.Second)
 	if len(sess.Requests) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(sess.Requests))
 	}

@@ -112,7 +112,8 @@ func (d *DB) QueryRequests(from, to, sessionID string, limit int) ([]store.Reque
 	}
 	q += " ORDER BY start_time DESC"
 	if limit > 0 {
-		q += fmt.Sprintf(" LIMIT %d", limit)
+		q += " LIMIT ?"
+		args = append(args, limit)
 	}
 
 	rows, err := d.conn.Query(q, args...)
@@ -132,10 +133,12 @@ func (d *DB) QuerySessions(limit int) ([]SessionSummary, error) {
 		FROM requests
 		GROUP BY session_id
 		ORDER BY last_seen DESC`
+	var args []any
 	if limit > 0 {
-		q += fmt.Sprintf(" LIMIT %d", limit)
+		q += " LIMIT ?"
+		args = append(args, limit)
 	}
-	rows, err := d.conn.Query(q)
+	rows, err := d.conn.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +178,8 @@ func (d *DB) QueryThrottle(ttftThresholdMs int, from, to, sessionID string, limi
 	}
 	q += " ORDER BY start_time DESC"
 	if limit > 0 {
-		q += fmt.Sprintf(" LIMIT %d", limit)
+		q += " LIMIT ?"
+		args = append(args, limit)
 	}
 
 	rows, err := d.conn.Query(q, args...)
