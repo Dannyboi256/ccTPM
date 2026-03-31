@@ -51,9 +51,16 @@ type sseMessageStart struct {
 	} `json:"message"`
 }
 
+type deltaUsage struct {
+	InputTokens   *int `json:"input_tokens,omitempty"`
+	OutputTokens  *int `json:"output_tokens,omitempty"`
+	CacheCreation *int `json:"cache_creation_input_tokens,omitempty"`
+	CacheRead     *int `json:"cache_read_input_tokens,omitempty"`
+}
+
 type sseMessageDelta struct {
-	Type  string     `json:"type"`
-	Usage *jsonUsage `json:"usage,omitempty"`
+	Type  string       `json:"type"`
+	Usage *deltaUsage  `json:"usage,omitempty"`
 }
 
 func ParseSSE(r io.Reader) (Result, error) {
@@ -86,17 +93,17 @@ func ParseSSE(r io.Reader) (Result, error) {
 			case "message_delta":
 				var msg sseMessageDelta
 				if err := json.Unmarshal([]byte(data), &msg); err == nil && msg.Usage != nil {
-					if msg.Usage.InputTokens != 0 {
-						result.InputTokens = msg.Usage.InputTokens
+					if msg.Usage.InputTokens != nil {
+						result.InputTokens = *msg.Usage.InputTokens
 					}
-					if msg.Usage.OutputTokens != 0 {
-						result.OutputTokens = msg.Usage.OutputTokens
+					if msg.Usage.OutputTokens != nil {
+						result.OutputTokens = *msg.Usage.OutputTokens
 					}
-					if msg.Usage.CacheCreation != 0 {
-						result.CacheCreation = msg.Usage.CacheCreation
+					if msg.Usage.CacheCreation != nil {
+						result.CacheCreation = *msg.Usage.CacheCreation
 					}
-					if msg.Usage.CacheRead != 0 {
-						result.CacheRead = msg.Usage.CacheRead
+					if msg.Usage.CacheRead != nil {
+						result.CacheRead = *msg.Usage.CacheRead
 					}
 				}
 
