@@ -184,7 +184,7 @@ func (d *DB) QuerySummary(from, to string) (map[string]any, error) {
 		COALESCE(SUM(input_tokens + output_tokens + cache_creation + cache_read), 0) as total_tokens,
 		COUNT(DISTINCT session_id) as session_count,
 		COALESCE(AVG(ttft_ms), 0) as avg_ttft_ms,
-		SUM(CASE WHEN status_code IN (429, 529) OR has_error = 1 THEN 1 ELSE 0 END) as throttle_events
+		COALESCE(SUM(CASE WHEN status_code IN (429, 529) OR has_error = 1 THEN 1 ELSE 0 END), 0) as throttle_events
 		FROM requests WHERE 1=1`
 	var args []any
 	if from != "" {
