@@ -211,3 +211,33 @@ func TestCalculateAggregateTPM(t *testing.T) {
 		t.Fatalf("expected ~10000 TPM, got %.0f", tpm)
 	}
 }
+
+func TestGetActiveTime(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	// No session -> 0
+	if at := s.GetActiveTime("nonexistent"); at != 0 {
+		t.Fatalf("expected 0 for nonexistent session, got %v", at)
+	}
+
+	// Single 30s request -> 30s active time
+	s.AddRecord(RequestRecord{
+		StartTime: now.Add(-30 * time.Second), EndTime: now,
+		SessionID: "s1", StatusCode: 200,
+	})
+	at := s.GetActiveTime("s1")
+	if at < 29*time.Second || at > 31*time.Second {
+		t.Fatalf("expected ~30s active time, got %v", at)
+	}
+
+	// Two concurrent 30s requests -> still 30s (merged)
+	s.AddRecord(RequestRecord{
+		StartTime: now.Add(-30 * time.Second), EndTime: now,
+		SessionID: "s1", StatusCode: 200,
+	})
+	at = s.GetActiveTime("s1")
+	if at < 29*time.Second || at > 31*time.Second {
+		t.Fatalf("expected ~30s active time with concurrent requests, got %v", at)
+	}
+}

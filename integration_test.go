@@ -190,3 +190,38 @@ func TestProxyHandles429(t *testing.T) {
 
 	close(dbChan)
 }
+
+func TestParseDuration(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected time.Duration
+		wantErr  bool
+	}{
+		{"24h", 24 * time.Hour, false},
+		{"1h30m", 90 * time.Minute, false},
+		{"7d", 7 * 24 * time.Hour, false},
+		{"1d", 24 * time.Hour, false},
+		{"0d", 0, false},
+		{"30d", 30 * 24 * time.Hour, false},
+		{"d", 0, true},
+		{"xd", 0, true},
+		{"", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parseDuration(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got %v", tt.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tt.input, err)
+			}
+			if got != tt.expected {
+				t.Fatalf("parseDuration(%q) = %v, want %v", tt.input, got, tt.expected)
+			}
+		})
+	}
+}

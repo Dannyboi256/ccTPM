@@ -50,11 +50,16 @@ func main() {
 		}
 		defer d.Close()
 
+		// Only filter by session if explicitly set (default "default" is for proxy mode)
+		sessionFilter := ""
+		if *session != "default" {
+			sessionFilter = *session
+		}
 		err = query.RunQuery(d, *queryMode, query.Opts{
 			From:          *from,
 			To:            *to,
 			TTFTThreshold: *ttftThreshold,
-			SessionID:     *session,
+			SessionID:     sessionFilter,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -87,7 +92,7 @@ func main() {
 		defer close(dbDone)
 		for rec := range dbChan {
 			if err := d.InsertRecord(rec); err != nil {
-				// Log to file, not stdout (TUI owns stdout)
+				log.Printf("db insert error: %v", err)
 			}
 		}
 	}()

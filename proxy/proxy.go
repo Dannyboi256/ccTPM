@@ -48,6 +48,7 @@ func (r *teeReadCloser) Read(p []byte) (int, error) {
 		select {
 		case r.ch <- cp:
 		default:
+			log.Println("warning: parser channel full, data chunk dropped")
 		}
 	}
 	if err != nil {
