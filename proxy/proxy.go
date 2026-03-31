@@ -3,6 +3,7 @@ package proxy
 import (
 	"claude-proxy/parser"
 	"claude-proxy/store"
+	"compress/gzip"
 	"context"
 	"io"
 	"log"
@@ -151,6 +152,7 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 	}
 
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+	isGzip := strings.Contains(resp.Header.Get("Content-Encoding"), "gzip")
 	inflightID := cfg.Store.AddInFlight(sessionID, endpoint)
 
 	ch := make(chan []byte, 64)
@@ -160,13 +162,31 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 	go func() {
 		defer cfg.Store.RemoveInFlight(inflightID)
 
+		var parserInput io.Reader = newChannelReader(ch)
+		if isGzip {
+			gz, err := gzip.NewReader(parserInput)
+			if err != nil {
+				log.Printf("gzip reader init: %v", err)
+				// drain channel so tee-reader never blocks
+				for range ch {
+				}
+				return
+			}
+			defer gz.Close()
+			parserInput = gz
+		}
+
 		var result parser.Result
 		if isSSE {
-			result, _ = parser.ParseSSE(newChannelReader(ch))
+			result, _ = parser.ParseSSE(parserInput)
 		} else {
 			var buf []byte
-			for chunk := range ch {
-				buf = append(buf, chunk...)
+			if isGzip {
+				buf, _ = io.ReadAll(parserInput)
+			} else {
+				for chunk := range ch {
+					buf = append(buf, chunk...)
+				}
 			}
 			result, _ = parser.ParseJSON(buf)
 		}

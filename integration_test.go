@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"claude-proxy/proxy"
 	"claude-proxy/store"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
@@ -186,6 +188,69 @@ func TestProxyHandles429(t *testing.T) {
 	}
 	if r.RetryAfter != "30" {
 		t.Fatalf("expected retry '30', got '%s'", r.RetryAfter)
+	}
+
+	close(dbChan)
+}
+
+func TestProxyHandlesGzipSSEStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+
+		events := strings.Join([]string{
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":4000,\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":1000}}}\n\n",
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":600}}\n\n",
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		}, "")
+
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		gz.Write([]byte(events))
+		gz.Close()
+		w.Write(buf.Bytes())
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	st := store.NewStore()
+	dbChan := make(chan store.RequestRecord, 256)
+	go func() { for range dbChan {} }()
+
+	p := proxy.NewProxy(proxy.Config{UpstreamURL: upstreamURL, SessionName: "gzip-test", Store: st, DBChan: dbChan})
+	proxyServer := httptest.NewServer(p)
+	defer proxyServer.Close()
+
+	resp, err := http.Get(proxyServer.URL + "/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	sess := st.GetSession("gzip-test")
+	if sess == nil {
+		t.Fatal("no session")
+	}
+	if len(sess.Requests) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(sess.Requests))
+	}
+	r := sess.Requests[0]
+	if r.InputTokens != 4000 {
+		t.Fatalf("expected 4000 input, got %d", r.InputTokens)
+	}
+	if r.OutputTokens != 600 {
+		t.Fatalf("expected 600 output, got %d", r.OutputTokens)
+	}
+	if r.CacheRead != 1000 {
+		t.Fatalf("expected 1000 cache read, got %d", r.CacheRead)
+	}
+	if r.Model != "claude-sonnet-4-20250514" {
+		t.Fatalf("expected model claude-sonnet-4-20250514, got %q", r.Model)
 	}
 
 	close(dbChan)
