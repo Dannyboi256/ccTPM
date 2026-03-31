@@ -41,7 +41,7 @@ Claude Code  ──HTTP──>  Proxy (localhost:8076)  ──HTTPS──>  api.
 
 `resp.Body` is a single `io.ReadCloser` — it cannot be read twice. To parse tokens without disrupting the stream to Claude Code, `ModifyResponse` replaces `resp.Body` with a custom wrapper:
 
-1. In `ModifyResponse`, check `resp.StatusCode`. For non-2xx responses, skip tee-reader setup (no usage data to extract). For 2xx, determine the parsing mode from `resp.Header.Get("Content-Type")`: `text/event-stream` → SSE parser, otherwise → JSON parser. Pass the parsing mode to the parser goroutine. Then wrap `resp.Body` with a custom `ReadCloser` that duplicates all bytes to a buffered channel.
+1. In `ModifyResponse`, extract response headers (`Retry-After`, `x-ratelimit-requests-remaining`, `x-ratelimit-tokens-remaining`) and `resp.StatusCode`. For non-2xx responses, record a `RequestRecord` with status code, headers, and zero tokens (no tee-reader needed — persist for throttling analysis). For 2xx, determine the parsing mode from `resp.Header.Get("Content-Type")`: `text/event-stream` → SSE parser, otherwise → JSON parser. Pass the parsing mode to the parser goroutine. Then wrap `resp.Body` with a custom `ReadCloser` that records the timestamp of the first `Read()` call (TTFT) and duplicates all bytes to a buffered channel.
 2. The proxy's normal copy loop reads the wrapper and forwards bytes to Claude Code as usual — no added latency.
 3. A background goroutine reads `[]byte` chunks from the buffered channel and parses SSE events (or JSON for non-streaming) to extract token usage.
 4. When the stream ends (EOF or error), the goroutine sends the completed `RequestRecord` to the store.
@@ -82,8 +82,15 @@ For non-streaming responses, the same pattern applies — the parser goroutine s
 | CacheCreation  | int           | `usage.cache_creation_input_tokens`      |
 | CacheRead      | int           | `usage.cache_read_input_tokens`          |
 | Endpoint       | string        | e.g. `/v1/messages`                      |
+| StatusCode     | int           | HTTP response status (200, 429, 529, etc.) |
+| TTFT           | time.Duration | Time-to-first-token: request sent → first byte of response body received. Key throttling signal — API may accept but delay generation. |
+| RetryAfter     | string        | `Retry-After` header value if present (empty otherwise) |
+| RateLimitReqRemaining | int   | `x-ratelimit-requests-remaining` header if present (-1 otherwise) |
+| RateLimitTokRemaining | int   | `x-ratelimit-tokens-remaining` header if present (-1 otherwise) |
 
 Latency is derived as `EndTime - StartTime`. Both timestamps are stored to support the merged-interval TPM calculation.
+
+**Throttling-detection fields:** `StatusCode` 429 indicates explicit rate limiting. TTFT is a subtler signal — when the API is throttling, it may accept the request but delay the start of token generation. Comparing TTFT trends over time reveals soft throttling. Rate-limit headers provide the API's own view of remaining capacity.
 
 Note: When extended thinking is enabled, thinking tokens are included in `output_tokens`. They are not broken out separately — this is intentionally out of scope for v1.
 
@@ -181,7 +188,7 @@ To avoid double-counting or recording stale values:
 event: error
 data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
 ```
-The parser must treat `event: error` as stream termination. Errored requests are discarded (no `RequestRecord` created) since they contain no meaningful token data. Additionally, `ModifyResponse` checks `resp.StatusCode` before setting up the tee-reader — non-2xx responses skip interception entirely.
+The parser must treat `event: error` as stream termination. Errored requests are still persisted with zero tokens — their `status_code`, `ttft_ms`, and rate-limit headers are valuable for throttling analysis. Non-2xx responses detected in `ModifyResponse` skip the tee-reader but are also persisted with status code and headers.
 
 The stream is forwarded to Claude Code in real-time via the buffered channel pattern — no buffering or added latency on the client side.
 
@@ -251,14 +258,18 @@ Module path: `claude-proxy` (local tool, not published to a registry).
 
 ```
 claude-proxy/
-├── main.go              # CLI flags, wiring, startup/shutdown
+├── main.go              # CLI flags, wiring, startup/shutdown, query mode routing
 ├── proxy/
-│   └── proxy.go         # ReverseProxy setup, ModifyResponse hook
+│   └── proxy.go         # ReverseProxy setup, ModifyResponse hook, TTFT wrapper
 ├── parser/
 │   ├── json.go          # Non-streaming response parser
 │   └── sse.go           # SSE streaming response parser
 ├── store/
-│   └── store.go         # Stats store, session management, TPM calculation
+│   └── store.go         # In-memory stats store, session management, TPM calculation
+├── db/
+│   └── db.go            # SQLite schema, inserts, query functions
+├── query/
+│   └── query.go         # CLI query mode (--query) formatting and output
 ├── tui/
 │   ├── tui.go           # Bubbletea model, update, view
 │   └── styles.go        # Lipgloss styling
@@ -270,16 +281,94 @@ claude-proxy/
 
 - `github.com/charmbracelet/bubbletea` — TUI framework
 - `github.com/charmbracelet/lipgloss` — TUI styling
-- Standard library: `net/http`, `net/http/httputil`, `encoding/json`, `sync`
+- `modernc.org/sqlite` — Pure Go SQLite (no CGo)
+- Standard library: `net/http`, `net/http/httputil`, `encoding/json`, `sync`, `database/sql`
 
 ### Logging
 
 All logging must use `tea.LogToFile()` or write to a file — never `fmt.Println`, `log.Println`, or any stdout/stderr output from proxy/parser code. Writing to stdout corrupts the bubbletea TUI display.
 
-## No Persistence
+## Persistence (SQLite)
 
-All stats are ephemeral — they reset when the proxy restarts. No disk storage.
+All request data is persisted to a SQLite database for historical analysis and throttling detection.
+
+**Library:** `modernc.org/sqlite` (pure Go, no CGo required).
+
+**Database file:** `~/.claude-proxy/data.db` (created on first run).
+
+### Schema
+
+```sql
+CREATE TABLE requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    start_time    DATETIME NOT NULL,
+    end_time      DATETIME NOT NULL,
+    model         TEXT NOT NULL,
+    endpoint      TEXT NOT NULL,
+    status_code   INTEGER NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation INTEGER NOT NULL DEFAULT 0,
+    cache_read    INTEGER NOT NULL DEFAULT 0,
+    ttft_ms       INTEGER NOT NULL DEFAULT 0,
+    retry_after   TEXT NOT NULL DEFAULT '',
+    ratelimit_req_remaining INTEGER NOT NULL DEFAULT -1,
+    ratelimit_tok_remaining INTEGER NOT NULL DEFAULT -1
+);
+
+CREATE INDEX idx_requests_session ON requests(session_id);
+CREATE INDEX idx_requests_start_time ON requests(start_time);
+CREATE INDEX idx_requests_model ON requests(model);
+CREATE INDEX idx_requests_status_code ON requests(status_code);
+```
+
+### Write behavior
+
+- Each completed `RequestRecord` is inserted into the database asynchronously via a buffered channel (separate from the parser channel) to avoid blocking the proxy.
+- Writes use WAL mode for concurrent read/write without locking the TUI's reads.
+- Errored requests (non-2xx) are also persisted — their `status_code` and `ttft_ms` are valuable for throttling analysis even without token data.
+
+### Startup behavior
+
+- On startup, the in-memory store is **not** populated from the database. The TUI shows only the current proxy session's live data.
+- Historical data is accessed via the CLI query interface or external SQL tools.
+
+### CLI query interface
+
+The binary supports a `--query` mode for historical analysis without starting the proxy:
+
+```bash
+# Show TPM by session
+claude-proxy --query sessions
+
+# Show requests in a time range
+claude-proxy --query requests --from "2026-03-30 09:00" --to "2026-03-30 17:00"
+
+# Show throttling events (429s and high TTFT)
+claude-proxy --query throttle
+
+# Show summary stats
+claude-proxy --query summary --last 24h
+```
+
+Query output is formatted as a table to stdout. The database file can also be queried directly with any SQLite client (`sqlite3 ~/.claude-proxy/data.db`).
 
 ## No Cost Estimation
 
 Cost estimation is explicitly out of scope.
+
+## CLI Configuration (updated)
+
+| Flag         | Default                         | Description            |
+|--------------|---------------------------------|------------------------|
+| `--port`     | `8076`                          | Proxy listen port      |
+| `--upstream` | `https://api.anthropic.com`     | Upstream API URL       |
+| `--session`  | `"default"`                     | Manual session name    |
+| `--db`       | `~/.claude-proxy/data.db`       | SQLite database path   |
+| `--query`    | (none)                          | Query mode: `sessions`, `requests`, `throttle`, `summary` |
+| `--from`     | (none)                          | Start time filter for queries |
+| `--to`       | (none)                          | End time filter for queries |
+| `--last`     | (none)                          | Relative time filter (e.g., `24h`, `7d`) |
+
+When `--query` is provided, the proxy does not start — it runs the query against the database and exits.
