@@ -215,6 +215,8 @@ The stream is forwarded to Claude Code in real-time via the buffered channel pat
 │ 12:03:52  /v1/messages  claude-sonnet-4-20250514  in:3200 out:450  cache:0    0.9s  │
 │ 12:04:01  /v1/messages  claude-sonnet-4-20250514  in:4100 out:1200 cache:800  1.4s  │
 │ 12:04:15  /v1/messages  claude-sonnet-4-20250514  in:4100 out:--   ⏳ 3.2s...      │
+│ 12:04:30  /v1/messages  --                        429  retry:30s                  │
+│ 12:04:35  /v1/messages  claude-sonnet-4-20250514  ERR  overloaded  0.8s           │
 ├─ Aggregate (All Sessions) ────────────────────────────────────────────────────┤
 │ Sessions: 3    Total: 234,500 tok    TPM: 28,100                              │
 │ Requests: 87   Uptime: 1h 23m                                                │
@@ -242,6 +244,14 @@ TUI redraws on a 1-second tick.
 | `--port`     | `8076`                          | Proxy listen port      |
 | `--upstream` | `https://api.anthropic.com`     | Upstream API URL       |
 | `--session`  | `"default"`                     | Manual session name    |
+| `--db`       | `~/.claude-proxy/data.db`       | SQLite database path   |
+| `--query`    | (none)                          | Query mode: `sessions`, `requests`, `throttle`, `summary` |
+| `--from`     | (none)                          | Start time filter for queries |
+| `--to`       | (none)                          | End time filter for queries |
+| `--last`     | (none)                          | Relative time filter (e.g., `24h`, `7d`) |
+| `--ttft-threshold` | `5000`                    | TTFT threshold in ms for `--query throttle` |
+
+When `--query` is provided, the proxy does not start — it runs the query against the database and exits.
 
 ### Usage
 
@@ -389,18 +399,3 @@ Query output is formatted as a table to stdout. The database file can also be qu
 
 Cost estimation is explicitly out of scope.
 
-## CLI Configuration (updated)
-
-| Flag         | Default                         | Description            |
-|--------------|---------------------------------|------------------------|
-| `--port`     | `8076`                          | Proxy listen port      |
-| `--upstream` | `https://api.anthropic.com`     | Upstream API URL       |
-| `--session`  | `"default"`                     | Manual session name    |
-| `--db`       | `~/.claude-proxy/data.db`       | SQLite database path   |
-| `--query`    | (none)                          | Query mode: `sessions`, `requests`, `throttle`, `summary` |
-| `--from`     | (none)                          | Start time filter for queries |
-| `--to`       | (none)                          | End time filter for queries |
-| `--last`     | (none)                          | Relative time filter (e.g., `24h`, `7d`) |
-| `--ttft-threshold` | `5000`                    | TTFT threshold in ms for `--query throttle` |
-
-When `--query` is provided, the proxy does not start — it runs the query against the database and exits.
