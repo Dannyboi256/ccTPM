@@ -21,7 +21,18 @@ Claude Code  ──HTTP──>  Proxy (localhost:8076)  ──HTTPS──>  api.
 
 ### Components
 
-1. **Reverse Proxy** — `httputil.ReverseProxy` forwarding to `https://api.anthropic.com`. Uses `ModifyResponse` to set up response body interception (see Streaming Architecture below).
+1. **Reverse Proxy** — `httputil.ReverseProxy` using `Rewrite` (not `Director`) to forward to `https://api.anthropic.com`. Uses `ModifyResponse` to set up response body interception (see Streaming Architecture below).
+
+   **Why `Rewrite` over `Director`:** With `Director`, a `Connection: x-api-key` header could cause Go's ReverseProxy to strip the API key as a hop-by-hop header, breaking authentication. `Rewrite` (Go 1.20+) is the recommended API and avoids this class of issues. Configuration:
+   ```go
+   proxy := &httputil.ReverseProxy{
+       Rewrite: func(pr *httputil.ProxyRequest) {
+           pr.SetURL(upstream)
+           pr.Out.Host = upstream.Host
+       },
+       ModifyResponse: modifyResponse,
+   }
+   ```
 2. **Stats Store** — Mutex-protected struct holding per-session and aggregate stats. Sessions keyed by session/conversation ID from request headers.
 3. **TUI** — `bubbletea` program running in the main goroutine, subscribing to store updates on a 1-second tick. Three panes: current session, request log, aggregate.
 4. **Response Parser** — Extracts token fields and model name. Handles both regular JSON and streaming (SSE) responses.
@@ -157,10 +168,13 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 
 Note: In `message_delta` events, `usage` is a top-level sibling of `delta`, not nested within it.
 
-**Parser strategy — single source of truth:** The `message_delta` usage fields are cumulative. To avoid double-counting:
+**Parser strategy — `message_delta` as final authority:** The `message_delta` usage fields are cumulative and may contain corrected values for all token fields (not just `output_tokens`). This happens with web search and tool use, where `input_tokens` in `message_delta` can differ from `message_start`.
+
+To avoid double-counting or recording stale values:
 - Extract `model` from `message_start`.
-- Extract `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` from `message_start` (these do not change during streaming).
-- Extract `output_tokens` from the final `message_delta` only (cumulative, supersedes any earlier values).
+- Extract initial `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` from `message_start`.
+- On `message_delta`: if `usage` is present, any fields it contains **override** the corresponding `message_start` values. If `usage` is absent (can happen with extended thinking), retain the `message_start` values as-is.
+- The `usage` object in `message_delta` may contain additional fields (e.g., `server_tool_use`) — these should be ignored without causing parse failures. Use lenient JSON parsing that ignores unknown fields.
 
 **SSE error handling:** The Anthropic API can emit `event: error` events:
 ```
@@ -251,6 +265,10 @@ claude-proxy/
 - `github.com/charmbracelet/bubbletea` — TUI framework
 - `github.com/charmbracelet/lipgloss` — TUI styling
 - Standard library: `net/http`, `net/http/httputil`, `encoding/json`, `sync`
+
+### Logging
+
+All logging must use `tea.LogToFile()` or write to a file — never `fmt.Println`, `log.Println`, or any stdout/stderr output from proxy/parser code. Writing to stdout corrupts the bubbletea TUI display.
 
 ## No Persistence
 
