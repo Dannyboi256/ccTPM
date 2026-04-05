@@ -31,16 +31,18 @@ type RequestRecord struct {
 	OTokensLimit     *int
 	OTokensRemaining *int
 	OTokensReset     string
-	RPMLimit         *int
-	RPMRemaining     *int
-	RPMReset         string
+
+	// Per-key request-rate headers (anthropic-ratelimit-requests-*)
+	RPMLimit     *int
+	RPMRemaining *int
+	RPMReset     string
 
 	// Unified OAuth rate-limit headers (anthropic-ratelimit-unified-*)
 	Unified5hUtil    *float64
 	Unified5hReset   *int64 // unix seconds
 	Unified5hStatus  string
 	Unified7dUtil    *float64
-	Unified7dReset   *int64
+	Unified7dReset   *int64 // unix seconds
 	Unified7dStatus  string
 	UnifiedStatus    string // "allowed" | "rate_limited"
 	UnifiedReprClaim string // e.g., "five_hour"
