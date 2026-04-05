@@ -146,7 +146,12 @@ ALTER TABLE requests ADD COLUMN unified_repr_claim  TEXT;
 
 All new columns are nullable. Rationale for nullable over sentinel: `unified_5h_util` is a float fraction where `0.0` is a legal value ("0% used"), so we cannot distinguish "zero utilization" from "header absent" with a `-1`/`0` sentinel. For consistency, the integer token-limit columns also use NULL rather than `-1`.
 
-The existing `ratelimit_req_remaining` and `ratelimit_tok_remaining` columns are preserved and populated from the fixed headers as synonyms for `rpm_remaining` and `itokens_remaining`. This keeps any existing user scripts against those columns working.
+The existing `ratelimit_req_remaining` and `ratelimit_tok_remaining` columns are preserved and populated from their natural legacy headers:
+
+- `ratelimit_req_remaining` ← `anthropic-ratelimit-requests-remaining` (same value as new `rpm_remaining`).
+- `ratelimit_tok_remaining` ← `anthropic-ratelimit-tokens-remaining` — the legacy combined "tokens remaining" header that Anthropic still emits (per the docs: "the most restrictive limit currently in effect, or the sum of input and output tokens if Workspace limits do not apply"). This is *not* the same as `itokens_remaining` — it is a separate header Anthropic continues to publish for backward compatibility. ccTPM stores it as-is in the legacy column.
+
+This keeps any existing user scripts against those columns working with no behavior change, and also preserves the legacy combined "tokens remaining" signal alongside the new per-direction fields.
 
 Idempotence: SQLite returns `SQLITE_ERROR` with message `duplicate column name: X` if a column already exists. The migration runner checks for that specific error text and continues past it. A schema_version table is not introduced — this is the only migration and a text-match check is simpler than bringing in a migration library.
 
@@ -347,9 +352,11 @@ other-sess    31500     6200      28       2026-04-03 09:15  2026-04-03 17:45
 | `--peak` | `false` | Switch to single-row peak output |
 | `--group-by` | unset | With `--peak`: `session` groups by session_id |
 | `--session` | unset | Filter to one session |
-| `--limit` | `10` | Row cap (matches existing query modes) |
+| `--limit` | `0` (unlimited) for bucketed mode; `10` for `--peak` modes | Row cap. Bucketed time-series defaults to unlimited because 10 rows is too few for any useful comparison (e.g. `--last 24h --bucket 1h` needs 24 rows). Peak modes keep the project's `10` convention. User can always override with `--limit N`. |
 
 Output uses `text/tabwriter` to match the style of existing `--query sessions` / `requests` / `throttle`.
+
+**Timezone of output.** SQL operates in UTC (all `start_time` / `end_time` values are stored as UTC by `db.InsertRecord`). For user-facing output, `BUCKET_START` and `OBSERVED AT` columns are rendered in the machine's **local timezone**, matching how `--query requests` and `--query throttle` already format timestamps (`r.StartTime.Format("15:04:05")` uses the `time.Time`'s local zone). Internal bucket boundaries are still computed in UTC seconds so bucket membership is stable across DST transitions; only the display is localized.
 
 ## Testing strategy
 
