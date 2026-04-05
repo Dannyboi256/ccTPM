@@ -337,11 +337,13 @@ BUCKET_START         MAX_ITPM  MAX_OTPM  MAX_RPM  SAMPLES
 **2. All-time peak:**
 ```
 $ ./ccTPM --query tpm --peak
-METRIC  VALUE   OBSERVED AT          SESSION
-ITPM    45200   2026-04-04 14:23     my-session
-OTPM    8700    2026-04-04 14:22     my-session
-RPM     42      2026-04-04 14:23     my-session
+METRIC  VALUE   FIRST_SEEN        LAST_SEEN
+ITPM    45200   2026-04-04 14:00  2026-04-04 18:00
+OTPM    8700    2026-04-04 14:00  2026-04-04 18:00
+RPM     42      2026-04-04 14:00  2026-04-04 18:00
 ```
+
+The `FIRST_SEEN` / `LAST_SEEN` columns show the range of minutes containing data inside the query window, not the exact minute each peak occurred in. Recovering per-metric peak timestamps would require a correlated subquery — intentionally deferred. Live session peaks (shown in the TUI) do have exact timestamps; use that pane for instant feedback, and `--query tpm --peak` for the historical maximum value.
 
 **3. Per-session peak:**
 ```
@@ -413,7 +415,7 @@ Parser already correctly extracts all four token types. Existing tests cover JSO
 - `TestRunTPM_BucketedTable` — expected header row + data row alignment.
 - `TestRunTPM_Peak` — single-row output format.
 - `TestRunTPM_PeakGroupBySession` — per-session row format.
-- `TestRunTPM_FlagValidation` — mutually exclusive flags error clearly.
+- `TestRunTPM_GroupBySessionRequiresPeak` — `--group-by session` without `--peak` is silently ignored (bucketed mode aggregates across sessions regardless). Documents the current contract; reversal would break this test.
 - `TestRunTPM_UnknownGroupBy` — rejects unknown `--group-by` values.
 
 ### `tui/` — no new automated tests
