@@ -336,11 +336,20 @@ func TestRollingITPM_AllRecordsOutsideWindow(t *testing.T) {
 }
 
 func TestRollingITPM_InFlightExcluded(t *testing.T) {
+	// Seed with a completed record so the session actually exists. Then add an
+	// in-flight entry. The completed record's tokens must count; the in-flight
+	// must contribute zero because it has no token data yet.
 	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(100, 0, 0, 0),
+	))
 	s.AddInFlight("s1", "/v1/messages")
-	got := s.RollingITPM("s1", time.Now())
-	if got != 0 {
-		t.Fatalf("expected 0 (in-flight excluded, no completed records), got %v", got)
+	got := s.RollingITPM("s1", now)
+	if got != 100 {
+		t.Fatalf("expected 100 (completed record counts, in-flight does not), got %v", got)
 	}
 }
 ```
@@ -883,6 +892,44 @@ func TestAggregatePeaks_TrackAcrossSessions(t *testing.T) {
 		t.Fatalf("expected MaxITPM=1000 unchanged, got %v", peaks.MaxITPM)
 	}
 }
+
+// TestAggregatePeaks_MultipleSessions verifies that the end-to-end chain
+// (RollingAggregate* → UpdateAggregatePeaks → GetAggregatePeaks) correctly
+// reflects the combined throughput of multiple sessions.
+func TestAggregatePeaks_MultipleSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	// Two sessions with different throughput inside the rolling window
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(400, 80, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(300, 60, 0, 0),
+	))
+
+	// Compute aggregate rolling metrics and push to peaks (simulating one TUI tick)
+	aItpm := s.RollingAggregateITPM(now)
+	aOtpm := s.RollingAggregateOTPM(now)
+	aRpm := s.RollingAggregateRPM(now)
+	s.UpdateAggregatePeaks(aItpm, aOtpm, aRpm, now)
+
+	peaks := s.GetAggregatePeaks()
+	// Aggregate ITPM must reflect sum of both sessions, not just the larger one
+	if peaks.MaxITPM != 700 { // 400 + 300
+		t.Errorf("expected aggregate MaxITPM=700 (sum across sessions), got %v", peaks.MaxITPM)
+	}
+	if peaks.MaxOTPM != 140 { // 80 + 60
+		t.Errorf("expected aggregate MaxOTPM=140, got %v", peaks.MaxOTPM)
+	}
+	if peaks.MaxRPM != 2 {
+		t.Errorf("expected aggregate MaxRPM=2, got %d", peaks.MaxRPM)
+	}
+}
 ```
 
 - [ ] **Step 2: Run the test to confirm it fails**
@@ -1143,6 +1190,26 @@ func TestExtractRateLimitHeaders_MalformedUtilization(t *testing.T) {
 	}
 }
 
+func TestExtractRateLimitHeaders_BothSetsCoexist(t *testing.T) {
+	// A response carrying both per-direction API-key headers and unified OAuth headers
+	// must populate both groups without interference.
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("anthropic-ratelimit-input-tokens-limit", "450000")
+	resp.Header.Set("anthropic-ratelimit-unified-5h-utilization", "0.0184")
+	resp.Header.Set("anthropic-ratelimit-unified-status", "allowed")
+
+	got := extractRateLimitHeaders(resp)
+	if got.ITokensLimit == nil || *got.ITokensLimit != 450000 {
+		t.Errorf("ITokensLimit wrong: %v", got.ITokensLimit)
+	}
+	if got.Unified5hUtil == nil || *got.Unified5hUtil != 0.0184 {
+		t.Errorf("Unified5hUtil wrong: %v", got.Unified5hUtil)
+	}
+	if got.UnifiedStatus != "allowed" {
+		t.Errorf("UnifiedStatus wrong: %q", got.UnifiedStatus)
+	}
+}
+
 func TestExtractRateLimitHeaders_UnifiedResetAsRFC3339(t *testing.T) {
 	resp := &http.Response{Header: http.Header{}}
 	resp.Header.Set("anthropic-ratelimit-unified-5h-reset", "2026-04-05T14:30:00Z")
@@ -1220,13 +1287,11 @@ func extractRateLimitHeaders(resp *http.Response) RateLimitHeaders {
 	out.RPMRemaining = parseIntHeader(h, "anthropic-ratelimit-requests-remaining")
 	out.RPMReset = h.Get("anthropic-ratelimit-requests-reset")
 
-	// Legacy combined tokens header. If absent, fall back to ITokensRemaining so the
-	// legacy ratelimit_tok_remaining DB column still reports something useful.
+	// Legacy combined tokens header. Stored as-is per the spec's self-review decision:
+	// this is a genuinely separate header from the per-direction ones, and populating
+	// the legacy column with ITokensRemaining when it's absent would silently conflate
+	// two different values. If the header is absent, the legacy column stays NULL.
 	out.LegacyTokensRemaining = parseIntHeader(h, "anthropic-ratelimit-tokens-remaining")
-	if out.LegacyTokensRemaining == nil && out.ITokensRemaining != nil {
-		v := *out.ITokensRemaining
-		out.LegacyTokensRemaining = &v
-	}
 
 	// Unified OAuth headers
 	out.UnifiedStatus = h.Get("anthropic-ratelimit-unified-status")
@@ -1549,7 +1614,9 @@ git commit -m "proxy: plumb all rate-limit header fields onto RequestRecord"
 - Modify: `db/db.go:49-74` (`createSchema`)
 - Modify: `db/db_test.go`
 
-Adds 17 nullable columns via `ALTER TABLE ADD COLUMN`, wrapped in duplicate-column error tolerance so repeated startup is idempotent.
+Adds **18** nullable columns via `ALTER TABLE ADD COLUMN`, wrapped in duplicate-column error tolerance so repeated startup is idempotent. The 17 header columns plus one `end_time_epoch INTEGER` column used for TPM bucketing.
+
+**Why `end_time_epoch` is necessary.** The `modernc.org/sqlite` driver stores Go `time.Time` values bound via `?` placeholders using Go's default `time.Time.String()` format, which includes a ` +0000 UTC` timezone suffix that SQLite's `strftime('%s', ...)` cannot parse — it returns NULL. The driver's DATETIME→string read-side conversion rewrites the bytes into RFC3339 only when scanning into a Go `string` variable, not when SQL date functions touch the raw column. Using `strftime` in the TPM queries therefore silently produces NULL for every row. The fix is to store an explicit integer unix-epoch column at insert time and bucket against that column directly. Rows inserted before this migration will have `end_time_epoch = NULL` and be excluded from TPM queries — documented as a known limitation, acceptable because pre-migration data also uses the old broken TPM formula anyway.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1581,6 +1648,7 @@ func TestSchemaMigration_AddsNewColumns(t *testing.T) {
 		cols[name] = true
 	}
 	expected := []string{
+		"end_time_epoch",
 		"itokens_limit", "itokens_remaining", "itokens_reset",
 		"otokens_limit", "otokens_remaining", "otokens_reset",
 		"rpm_limit", "rpm_remaining", "rpm_reset",
@@ -1592,6 +1660,53 @@ func TestSchemaMigration_AddsNewColumns(t *testing.T) {
 		if !cols[c] {
 			t.Errorf("missing column: %s", c)
 		}
+	}
+}
+
+func TestSchemaMigration_PreservesExistingData(t *testing.T) {
+	// Simulate an old-schema DB by opening in-memory, inserting a row using the
+	// old column set, then re-running createSchema() and verifying the row survives.
+	// Uses a raw SQL insert with only old columns to mimic a pre-migration DB.
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Insert a row. At this point createSchema has already run (via Open), so
+	// all columns exist. We simulate the old-schema case by only setting old columns
+	// in the INSERT and verifying the new columns come back as NULL / zero-value.
+	_, err = d.conn.Exec(`INSERT INTO requests (
+		session_id, start_time, end_time, model, endpoint, status_code,
+		input_tokens, output_tokens, cache_creation, cache_read,
+		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error
+	) VALUES ('s1', ?, ?, 'm', '/v1/messages', 200, 100, 50, 0, 0, 0, '', -1, -1, 0)`,
+		time.Now().Add(-5*time.Second).UTC(), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Run createSchema again — should be idempotent and not damage the row.
+	if err := d.createSchema(); err != nil {
+		t.Fatalf("second createSchema failed: %v", err)
+	}
+
+	rows, err := d.QueryRequests("", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after idempotent migration, got %d", len(rows))
+	}
+	if rows[0].SessionID != "s1" || rows[0].InputTokens != 100 {
+		t.Fatalf("old data corrupted: %+v", rows[0])
+	}
+	// New nullable fields should be nil / empty on the old-schema row
+	if rows[0].ITokensLimit != nil {
+		t.Errorf("expected nil ITokensLimit on old-schema row, got %v", *rows[0].ITokensLimit)
+	}
+	if rows[0].UnifiedStatus != "" {
+		t.Errorf("expected empty UnifiedStatus on old-schema row, got %q", rows[0].UnifiedStatus)
 	}
 }
 
@@ -1650,7 +1765,10 @@ func (d *DB) createSchema() error {
 
 	// Additive migration for the ITPM/OTPM/RPM design. Each ALTER TABLE is idempotent
 	// via duplicate-column error tolerance so repeated startup is safe.
+	// end_time_epoch is required because modernc.org/sqlite stores time.Time values
+	// in a format SQLite's strftime() cannot parse. See spec for details.
 	alters := []string{
+		`ALTER TABLE requests ADD COLUMN end_time_epoch      INTEGER`,
 		`ALTER TABLE requests ADD COLUMN itokens_limit       INTEGER`,
 		`ALTER TABLE requests ADD COLUMN itokens_remaining   INTEGER`,
 		`ALTER TABLE requests ADD COLUMN itokens_reset       TEXT`,
@@ -1676,6 +1794,10 @@ func (d *DB) createSchema() error {
 				return fmt.Errorf("migration failed (%s): %w", stmt, err)
 			}
 		}
+	}
+	// Index on end_time_epoch for TPM bucket queries.
+	if _, err := d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_end_time_epoch ON requests(end_time_epoch)`); err != nil {
+		return fmt.Errorf("create idx_requests_end_time_epoch: %w", err)
 	}
 	return nil
 }
@@ -1817,7 +1939,7 @@ Replace `InsertRecord` in `db/db.go` with:
 func (d *DB) InsertRecord(rec store.RequestRecord) error {
 	_, err := d.conn.Exec(`
 		INSERT INTO requests (
-			session_id, start_time, end_time, model, endpoint, status_code,
+			session_id, start_time, end_time, end_time_epoch, model, endpoint, status_code,
 			input_tokens, output_tokens, cache_creation, cache_read,
 			ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
 			itokens_limit, itokens_remaining, itokens_reset,
@@ -1826,9 +1948,10 @@ func (d *DB) InsertRecord(rec store.RequestRecord) error {
 			unified_5h_util, unified_5h_reset, unified_5h_status,
 			unified_7d_util, unified_7d_reset, unified_7d_status,
 			unified_status, unified_repr_claim
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.SessionID, rec.StartTime.UTC(), rec.EndTime.UTC(), rec.Model, rec.Endpoint, rec.StatusCode,
+		rec.SessionID, rec.StartTime.UTC(), rec.EndTime.UTC(), rec.EndTime.UTC().Unix(),
+		rec.Model, rec.Endpoint, rec.StatusCode,
 		rec.InputTokens, rec.OutputTokens, rec.CacheCreation, rec.CacheRead,
 		rec.TTFT.Milliseconds(), rec.RetryAfter, rec.RateLimitReqRemaining, rec.RateLimitTokRemaining,
 		boolToInt(rec.HasError),
@@ -2133,6 +2256,50 @@ func TestQueryTPMBuckets_EmptyRange(t *testing.T) {
 	}
 }
 
+func TestQueryTPMBuckets_BucketBoundaryGrouping(t *testing.T) {
+	// A record ending at 14:59:59 must group into the 14:00 hour bucket (not 15:00)
+	// when bucketSeconds=3600. A record at 15:00:00 must group into the 15:00 bucket.
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	at1459 := time.Date(2026, 4, 5, 14, 59, 59, 0, time.UTC)
+	at1500 := time.Date(2026, 4, 5, 15, 0, 0, 0, time.UTC)
+	at1501 := time.Date(2026, 4, 5, 15, 0, 1, 0, time.UTC)
+
+	_ = d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: at1459.Add(-1 * time.Second), EndTime: at1459, InputTokens: 100, StatusCode: 200})
+	_ = d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: at1500.Add(-1 * time.Second), EndTime: at1500, InputTokens: 200, StatusCode: 200})
+	_ = d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: at1501.Add(-1 * time.Second), EndTime: at1501, InputTokens: 300, StatusCode: 200})
+
+	buckets, err := d.QueryTPMBuckets(at1459.Add(-1*time.Minute), at1501.Add(1*time.Minute), 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("expected 2 hour buckets, got %d: %+v", len(buckets), buckets)
+	}
+	// First bucket starts at 14:00:00 UTC, second at 15:00:00 UTC
+	if buckets[0].BucketStart.Hour() != 14 {
+		t.Errorf("expected first bucket at hour 14, got %v", buckets[0].BucketStart)
+	}
+	if buckets[1].BucketStart.Hour() != 15 {
+		t.Errorf("expected second bucket at hour 15, got %v", buckets[1].BucketStart)
+	}
+	// 14:59:59 record (ITPM 100) must be in the first bucket, not the second.
+	// Inner CTE produces per-minute windows; with only one record per minute,
+	// each minute's itpm equals that record's tokens. The hour bucket's MAX
+	// picks the largest minute-itpm in that hour.
+	if buckets[0].MaxITPM != 100 {
+		t.Errorf("expected 14:00 bucket MaxITPM=100 (from the 14:59:59 record), got %v", buckets[0].MaxITPM)
+	}
+	// 15:00:00 and 15:00:01 both fall in minute 15:00, so their itpm combines: 200+300=500
+	if buckets[1].MaxITPM != 500 {
+		t.Errorf("expected 15:00 bucket MaxITPM=500 (combined minute 15:00), got %v", buckets[1].MaxITPM)
+	}
+}
+
 func TestQueryTPMPeak_AllTime(t *testing.T) {
 	d, err := Open(":memory:")
 	if err != nil {
@@ -2233,15 +2400,19 @@ func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket
 	if bucketSeconds <= 0 {
 		bucketSeconds = 60
 	}
+	// end_time_epoch is an integer unix timestamp populated at insert time. We use it
+	// directly instead of strftime('%s', end_time) because modernc.org/sqlite stores
+	// time.Time values in a format SQLite's date functions cannot parse.
 	q := `
 		WITH minute_windows AS (
 			SELECT
-				CAST(strftime('%s', end_time) AS INTEGER) / 60 * 60 AS minute_epoch,
+				(end_time_epoch / 60) * 60        AS minute_epoch,
 				SUM(input_tokens + cache_creation) AS itpm,
 				SUM(output_tokens)                 AS otpm,
 				COUNT(*)                           AS rpm
 			FROM requests
-			WHERE end_time BETWEEN ? AND ?
+			WHERE end_time_epoch BETWEEN ? AND ?
+			  AND end_time_epoch IS NOT NULL
 			GROUP BY minute_epoch
 		)
 		SELECT
@@ -2253,7 +2424,7 @@ func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket
 		FROM minute_windows
 		GROUP BY bucket_epoch
 		ORDER BY bucket_epoch ASC`
-	rows, err := d.conn.Query(q, from.UTC(), to.UTC(), bucketSeconds, bucketSeconds)
+	rows, err := d.conn.Query(q, from.UTC().Unix(), to.UTC().Unix(), bucketSeconds, bucketSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -2293,19 +2464,20 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 		return nil, fmt.Errorf("unknown group-by: %q (valid: \"\", \"session\")", groupBy)
 	}
 
-	// Compute per-minute rates first, then pick max per grouping.
+	// Uses end_time_epoch (integer unix seconds) for the same reasons as QueryTPMBuckets.
 	var q string
 	if groupBy == "session" {
 		q = `
 			WITH minute_windows AS (
 				SELECT
 					session_id,
-					CAST(strftime('%s', end_time) AS INTEGER) / 60 * 60 AS minute_epoch,
+					(end_time_epoch / 60) * 60        AS minute_epoch,
 					SUM(input_tokens + cache_creation) AS itpm,
 					SUM(output_tokens)                 AS otpm,
 					COUNT(*)                           AS rpm
 				FROM requests
-				WHERE end_time BETWEEN ? AND ?
+				WHERE end_time_epoch BETWEEN ? AND ?
+				  AND end_time_epoch IS NOT NULL
 				GROUP BY session_id, minute_epoch
 			)
 			SELECT
@@ -2323,12 +2495,13 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 			WITH minute_windows AS (
 				SELECT
 					session_id,
-					CAST(strftime('%s', end_time) AS INTEGER) / 60 * 60 AS minute_epoch,
+					(end_time_epoch / 60) * 60        AS minute_epoch,
 					SUM(input_tokens + cache_creation) AS itpm,
 					SUM(output_tokens)                 AS otpm,
 					COUNT(*)                           AS rpm
 				FROM requests
-				WHERE end_time BETWEEN ? AND ?
+				WHERE end_time_epoch BETWEEN ? AND ?
+				  AND end_time_epoch IS NOT NULL
 				GROUP BY session_id, minute_epoch
 			)
 			SELECT
@@ -2341,7 +2514,7 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 			FROM minute_windows`
 	}
 
-	rows, err := d.conn.Query(q, from.UTC(), to.UTC())
+	rows, err := d.conn.Query(q, from.UTC().Unix(), to.UTC().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -2521,6 +2694,38 @@ func TestRunTPM_UnknownGroupBy(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown group-by")
+	}
+}
+
+func TestRunTPM_GroupBySessionRequiresPeak(t *testing.T) {
+	// --group-by session only makes sense with --peak. Bucketed mode without --peak
+	// aggregates across all sessions into time buckets, so session grouping is ignored.
+	// This test documents that behavior: passing GroupBy without Peak is accepted
+	// (GroupBy is silently unused in bucketed mode). If we later decide to reject it,
+	// this test will fail and force an explicit rules update.
+	d, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	_ = d.InsertRecord(store.RequestRecord{
+		SessionID: "s1",
+		StartTime: time.Now().Add(-5 * time.Second),
+		EndTime:   time.Now(),
+		InputTokens: 100, StatusCode: 200,
+	})
+
+	var buf bytes.Buffer
+	err = RunQuery(d, "tpm", Opts{
+		GroupBy: "session", // with no --peak, should be silently ignored
+		Writer:  &buf,
+	})
+	if err != nil {
+		t.Fatalf("expected no error when GroupBy is set without Peak, got: %v", err)
+	}
+	if !strings.Contains(buf.String(), "BUCKET_START") {
+		t.Errorf("expected bucketed output (GroupBy ignored), got %q", buf.String())
 	}
 }
 ```
@@ -2912,17 +3117,21 @@ git commit -m "tui: replace single TPM display with ITPM/OTPM/RPM three-row bloc
 
 ---
 
-## Task 16: Wire new flags into `main.go`
+## Task 16: Wire new flags into `main.go` and adjust `--limit` default
 
 **Files:**
 - Modify: `main.go` (flag definitions and query dispatch around lines 24-70)
+- Modify: `query/query.go` (per-mode default limits in `runSessions`, `runRequests`, `runThrottle`)
 
-- [ ] **Step 1: Add the new flags and wire them into `query.Opts`**
+The spec self-review changed the `--limit` default contract: `tpm` bucketed mode should default to **unlimited** (a 24h/1h bucket query needs 24 rows, not 10), while `--peak` modes and the existing modes (`sessions`/`requests`/`throttle`) keep the project's `10` convention. Implementing this means flipping the CLI flag default to `0` and having each mode's `runX` function apply its own default when `opts.Limit == 0`.
 
-In `main.go`, after the existing flag definitions (around line 33), add:
+- [ ] **Step 1: Change the `--limit` CLI default to `0` and add the new flags**
+
+In `main.go`, modify the existing `limit` flag definition (line 33) and add the three new flags after it:
 
 ```go
-	bucket := flag.Int("bucket", 0, "TPM query bucket size (e.g. 60, 300, 3600 seconds). 0 = default 5m")
+	limit := flag.Int("limit", 0, "Max rows to return in query mode (0 = per-mode default: 10 for most, unlimited for tpm bucketed)")
+	bucket := flag.Int("bucket", 0, "TPM query bucket size in seconds (e.g. 60, 300, 3600). 0 = default 5m")
 	peak := flag.Bool("peak", false, "TPM query peak mode (single-row max)")
 	groupBy := flag.String("group-by", "", "TPM query group-by: 'session' or empty")
 ```
@@ -2942,7 +3151,50 @@ Then update the `query.RunQuery` call (around lines 59-65) to pass the new field
 		})
 ```
 
-- [ ] **Step 2: Update the query mode flag description to include `tpm`**
+- [ ] **Step 2: Apply the 10-row default inside each pre-existing runX function**
+
+In `query/query.go`, each of `runSessions`, `runRequests`, `runThrottle` currently passes `opts.Limit` directly to the corresponding `QueryX(..., limit)` which interprets `limit <= 0` as "no LIMIT clause". That is the wrong behavior for these modes now that the CLI default is 0. Apply a local default.
+
+Modify `runSessions`:
+
+```go
+func runSessions(d *db.DB, w io.Writer, limit int) error {
+	if limit <= 0 {
+		limit = 10
+	}
+	sessions, err := d.QuerySessions(limit)
+	// ... rest unchanged
+```
+
+Modify `runRequests` — at the top of the function, before `d.QueryRequests(...)`:
+
+```go
+func runRequests(d *db.DB, w io.Writer, opts Opts) error {
+	if opts.Limit <= 0 {
+		opts.Limit = 10
+	}
+	rows, err := d.QueryRequests(opts.From, opts.To, opts.SessionID, opts.Limit)
+	// ... rest unchanged
+```
+
+Modify `runThrottle` similarly, at the top:
+
+```go
+func runThrottle(d *db.DB, w io.Writer, opts Opts) error {
+	if opts.Limit <= 0 {
+		opts.Limit = 10
+	}
+	threshold := opts.TTFTThreshold
+	// ... rest unchanged
+```
+
+`runSummary` does not take a limit, so it is unchanged.
+
+`runTPMBuckets` already treats `opts.Limit <= 0` as "unlimited" (see Task 14 — it only truncates if `opts.Limit > 0`). No change needed there.
+
+`runTPMPeak` already applies its own `if limit <= 0 { limit = 10 }` default (Task 14 implemented it). No change needed.
+
+- [ ] **Step 3: Update the query mode flag description to include `tpm`**
 
 Replace the `queryMode` flag line (around line 28):
 
@@ -2950,28 +3202,83 @@ Replace the `queryMode` flag line (around line 28):
 	queryMode := flag.String("query", "", "Query mode: sessions, requests, throttle, summary, tpm")
 ```
 
-- [ ] **Step 3: Build and run a smoke test**
+- [ ] **Step 4: Add a test confirming bucketed mode returns more than 10 rows when 15+ buckets exist**
+
+Append to `query/query_test.go`:
+
+```go
+func TestRunTPM_BucketedDefaultLimitIsUnlimited(t *testing.T) {
+	d, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Insert 15 records, each one minute apart — should produce 15 distinct 1-minute buckets
+	base := time.Date(2026, 4, 5, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 15; i++ {
+		end := base.Add(time.Duration(i) * time.Minute)
+		_ = d.InsertRecord(store.RequestRecord{
+			SessionID:  "s1",
+			StartTime:  end.Add(-5 * time.Second),
+			EndTime:    end,
+			InputTokens: 100 * (i + 1), // distinct per bucket
+			StatusCode: 200,
+		})
+	}
+
+	var buf bytes.Buffer
+	err = RunQuery(d, "tpm", Opts{
+		From:   base.Add(-1 * time.Minute).Format("2006-01-02 15:04:05"),
+		To:     base.Add(20 * time.Minute).Format("2006-01-02 15:04:05"),
+		Bucket: 60, // 1-minute buckets
+		Limit:  0,  // default — should be unlimited for tpm bucketed
+		Writer: &buf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Count data rows (skip the header line)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	dataRows := len(lines) - 1
+	if dataRows < 15 {
+		t.Errorf("expected at least 15 bucket rows with unlimited default, got %d (output: %q)", dataRows, buf.String())
+	}
+}
+```
+
+- [ ] **Step 5: Build and run the test**
+
+Run: `go test -run TestRunTPM_BucketedDefaultLimitIsUnlimited ./query`
+Expected: PASS.
+
+- [ ] **Step 6: Build and run a smoke test**
 
 ```bash
 go build -o ccTPM .
-./ccTPM --query tpm --db :memory: 2>&1 || true
-```
-
-Expected: the binary recognizes `tpm` as a query mode and prints an empty result (no records). Specifically, the error `unknown query type: tpm` should NOT appear. (A different error about `:memory:` is expected since we're running outside a proxy session.)
-
-A cleaner smoke test: use an actual file.
-
-```bash
 ./ccTPM --query tpm --db /tmp/cctpm-smoke.db --last 1h
 ```
 
 Expected: empty bucketed output with headers only, or a table if there's data. No "unknown query type" error.
 
-- [ ] **Step 4: Commit**
+```bash
+rm /tmp/cctpm-smoke.db*
+```
+
+- [ ] **Step 7: Run the full query and store test suites**
+
+Run: `go test ./query ./store`
+Expected: PASS (all existing tests — `runSessions`/`runRequests`/`runThrottle` now apply their own default-10 limit).
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add main.go
-git commit -m "main: wire --bucket, --peak, --group-by flags for tpm query mode"
+git add main.go query/query.go query/query_test.go
+git commit -m "main/query: wire tpm query flags and per-mode limit defaults
+
+--limit CLI default flips to 0 so tpm bucketed mode can be unlimited
+while sessions/requests/throttle keep the project's 10-row convention
+via per-runX function defaults."
 ```
 
 ---

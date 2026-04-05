@@ -88,31 +88,38 @@ Peaks reset when the session is pruned at the 1-hour inactivity boundary (existi
 
 ## Historical query and SQL approach
 
-`QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket, error)` computes per-bucket max rates via a two-stage SQL query:
+`QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket, error)` computes per-bucket max rates via a two-stage SQL query.
+
+**Why a new `end_time_epoch` integer column is required.** The obvious approach — `strftime('%s', end_time)` — **does not work** with the `modernc.org/sqlite` driver. When `db.InsertRecord` binds a Go `time.Time` through a `?` placeholder, the driver stores it using Go's default `time.Time.String()` format: `"2026-04-05 14:23:45 +0000 UTC"`. SQLite's `strftime` cannot parse the trailing ` +0000 UTC` suffix and returns NULL. The driver has a special DATETIME→string read-side conversion that rewrites the stored bytes into RFC3339 when you `SELECT end_time` into a Go string, but that conversion is not applied when SQLite's date functions look at the raw column bytes — so the data looks fine via `scanRecords` but is invisible to `strftime`.
+
+To sidestep this entirely, a dedicated `end_time_epoch INTEGER` column is added to the schema. It is populated at insert time from `rec.EndTime.UTC().Unix()` — an unambiguous integer, trivially indexable, no format ambiguity. The SQL below uses that column directly; `strftime` is not called anywhere in the TPM query path.
+
+Rows predating the migration will have `end_time_epoch = NULL` and will be silently excluded from TPM queries. This is acceptable: pre-migration rows also predate the header-capture fix, and their TPM values computed from the old broken `CalculateTPM` formula are not comparable to the new metric anyway. Documented as a known limitation.
 
 ```sql
 WITH minute_windows AS (
   SELECT
-    CAST(strftime('%s', end_time) AS INTEGER) / 60 * 60 AS minute_epoch,
+    (end_time_epoch / 60) * 60                      AS minute_epoch,
     SUM(input_tokens + cache_creation)              AS itpm,
     SUM(output_tokens)                              AS otpm,
     COUNT(*)                                        AS rpm
   FROM requests
-  WHERE end_time BETWEEN ? AND ?
+  WHERE end_time_epoch BETWEEN ? AND ?
+    AND end_time_epoch IS NOT NULL
   GROUP BY minute_epoch
 )
 SELECT
-  minute_epoch / ? * ? AS bucket_epoch,
-  MAX(itpm)            AS max_itpm,
-  MAX(otpm)            AS max_otpm,
-  MAX(rpm)             AS max_rpm,
-  COUNT(*)             AS sample_minutes
+  (minute_epoch / ?) * ? AS bucket_epoch,
+  MAX(itpm)              AS max_itpm,
+  MAX(otpm)              AS max_otpm,
+  MAX(rpm)               AS max_rpm,
+  COUNT(*)               AS sample_minutes
 FROM minute_windows
 GROUP BY bucket_epoch
 ORDER BY bucket_epoch;
 ```
 
-The inner CTE produces per-minute rates keyed on minute-of-end. The outer query buckets those minutes at the requested granularity and selects the peak. `sample_minutes` is exposed so the user can spot buckets with thin data (e.g., a 1h bucket with only 3 active minutes).
+The inner CTE produces per-minute rates keyed on minute-of-end (integer seconds since epoch, floored to minute). The outer query buckets those minutes at the requested granularity and selects the peak. `sample_minutes` is exposed so the user can spot buckets with thin data (e.g., a 1h bucket with only 3 active minutes).
 
 **Caveat on approximation:** this groups by "minute the request ended in" rather than a true sliding 60-second window. A burst of 30 requests in seconds 55–65 of a minute would split across two minute rows (say, 10 in minute N and 20 in minute N+1) rather than showing as one 30-request rolling window. For bucket sizes of 5 minutes or larger — which covers every realistic user query — the error is negligible. A true sliding window would require a per-second base table and window functions, which is overkill for this use case.
 
@@ -125,6 +132,8 @@ Additive, no destructive changes, executed inline during `createSchema()` at sta
 ```sql
 -- Executed after CREATE TABLE IF NOT EXISTS; each statement is wrapped in
 -- "ignore 'duplicate column' error" so repeated runs are idempotent.
+ALTER TABLE requests ADD COLUMN end_time_epoch      INTEGER;   -- unix seconds, NULL for pre-migration rows
+CREATE INDEX IF NOT EXISTS idx_requests_end_time_epoch ON requests(end_time_epoch);
 ALTER TABLE requests ADD COLUMN itokens_limit       INTEGER;
 ALTER TABLE requests ADD COLUMN itokens_remaining   INTEGER;
 ALTER TABLE requests ADD COLUMN itokens_reset       TEXT;      -- RFC3339
