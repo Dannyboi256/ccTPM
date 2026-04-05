@@ -212,6 +212,33 @@ func TestCalculateAggregateTPM(t *testing.T) {
 	}
 }
 
+func TestRequestRecordNullableHeaderFields(t *testing.T) {
+	iLimit := 450000
+	iRemaining := 448500
+	fiveHUtil := 0.0184
+	fiveHReset := int64(1712345678)
+
+	rec := RequestRecord{
+		SessionID:         "s1",
+		ITokensLimit:      &iLimit,
+		ITokensRemaining:  &iRemaining,
+		ITokensReset:      "2026-04-05T14:30:00Z",
+		Unified5hUtil:     &fiveHUtil,
+		Unified5hReset:    &fiveHReset,
+		UnifiedStatus:     "allowed",
+		UnifiedReprClaim:  "five_hour",
+	}
+	if rec.ITokensLimit == nil || *rec.ITokensLimit != 450000 {
+		t.Fatalf("ITokensLimit not set correctly")
+	}
+	if rec.Unified5hUtil == nil || *rec.Unified5hUtil != 0.0184 {
+		t.Fatalf("Unified5hUtil not set correctly")
+	}
+	if rec.UnifiedStatus != "allowed" {
+		t.Fatalf("UnifiedStatus not set correctly")
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()

@@ -23,6 +23,27 @@ type RequestRecord struct {
 	RateLimitTokRemaining int
 	HasError              bool
 	SessionID             string
+
+	// Per-direction API-key rate-limit headers (anthropic-ratelimit-{input,output}-tokens-*)
+	ITokensLimit     *int
+	ITokensRemaining *int
+	ITokensReset     string // RFC3339 as emitted by API
+	OTokensLimit     *int
+	OTokensRemaining *int
+	OTokensReset     string
+	RPMLimit         *int
+	RPMRemaining     *int
+	RPMReset         string
+
+	// Unified OAuth rate-limit headers (anthropic-ratelimit-unified-*)
+	Unified5hUtil    *float64
+	Unified5hReset   *int64 // unix seconds
+	Unified5hStatus  string
+	Unified7dUtil    *float64
+	Unified7dReset   *int64
+	Unified7dStatus  string
+	UnifiedStatus    string // "allowed" | "rate_limited"
+	UnifiedReprClaim string // e.g., "five_hour"
 }
 
 type Session struct {
