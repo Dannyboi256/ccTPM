@@ -5,6 +5,54 @@ import (
 	"time"
 )
 
+// Test helpers — unexported, package-local.
+type testRecordOpt func(*RequestRecord)
+
+func newTestRecord(opts ...testRecordOpt) RequestRecord {
+	base := time.Now()
+	rec := RequestRecord{
+		SessionID:  "test-session",
+		StartTime:  base.Add(-1 * time.Second),
+		EndTime:    base,
+		Model:      "claude-sonnet-4-20250514",
+		StatusCode: 200,
+		Endpoint:   "/v1/messages",
+	}
+	for _, opt := range opts {
+		opt(&rec)
+	}
+	return rec
+}
+
+func withSession(id string) testRecordOpt {
+	return func(r *RequestRecord) { r.SessionID = id }
+}
+
+func withEndTime(t time.Time) testRecordOpt {
+	return func(r *RequestRecord) {
+		r.EndTime = t
+		if r.StartTime.After(t) || r.StartTime.Equal(t) {
+			r.StartTime = t.Add(-1 * time.Second)
+		}
+	}
+}
+
+func withStartEnd(start, end time.Time) testRecordOpt {
+	return func(r *RequestRecord) {
+		r.StartTime = start
+		r.EndTime = end
+	}
+}
+
+func withTokens(input, output, cacheCreate, cacheRead int) testRecordOpt {
+	return func(r *RequestRecord) {
+		r.InputTokens = input
+		r.OutputTokens = output
+		r.CacheCreation = cacheCreate
+		r.CacheRead = cacheRead
+	}
+}
+
 func TestNewStore(t *testing.T) {
 	s := NewStore()
 	if s == nil {
@@ -236,6 +284,40 @@ func TestRequestRecordNullableHeaderFields(t *testing.T) {
 	}
 	if rec.UnifiedStatus != "allowed" {
 		t.Fatalf("UnifiedStatus not set correctly")
+	}
+}
+
+func TestNewTestRecordDefaults(t *testing.T) {
+	rec := newTestRecord()
+	if rec.SessionID != "test-session" {
+		t.Fatalf("expected default session 'test-session', got %q", rec.SessionID)
+	}
+	if rec.StatusCode != 200 {
+		t.Fatalf("expected default status 200, got %d", rec.StatusCode)
+	}
+	if rec.StartTime.IsZero() || rec.EndTime.IsZero() {
+		t.Fatal("expected default timestamps to be set")
+	}
+	if !rec.EndTime.After(rec.StartTime) {
+		t.Fatal("expected EndTime to be after StartTime")
+	}
+}
+
+func TestNewTestRecordOverrides(t *testing.T) {
+	at := time.Date(2026, 4, 5, 14, 0, 0, 0, time.UTC)
+	rec := newTestRecord(
+		withSession("alt"),
+		withEndTime(at),
+		withTokens(1000, 200, 50, 300),
+	)
+	if rec.SessionID != "alt" {
+		t.Fatalf("expected 'alt', got %q", rec.SessionID)
+	}
+	if !rec.EndTime.Equal(at) {
+		t.Fatalf("expected EndTime %v, got %v", at, rec.EndTime)
+	}
+	if rec.InputTokens != 1000 || rec.OutputTokens != 200 || rec.CacheCreation != 50 || rec.CacheRead != 300 {
+		t.Fatalf("token overrides not applied: %+v", rec)
 	}
 }
 
