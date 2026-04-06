@@ -269,6 +269,29 @@ func (s *Store) CalculateTPM(sessionID string) float64 {
 	return float64(totalTokens) / activeTime.Minutes()
 }
 
+// RollingITPM returns the rolling 60-second ITPM (input tokens per minute) for a session.
+// A record contributes if its EndTime falls in (now-60s, now].
+// ITPM = Σ(InputTokens + CacheCreation) — matches Anthropic's documented ITPM definition.
+// CacheRead is deliberately excluded (modern models do not count it toward ITPM).
+// In-flight requests are excluded because their token counts are not yet known.
+func (s *Store) RollingITPM(sessionID string, now time.Time) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return 0
+	}
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, r := range sess.Requests {
+		if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+			total += r.InputTokens + r.CacheCreation
+		}
+	}
+	return float64(total)
+}
+
 // CalculateAggregateTPM returns the TPM across all sessions.
 func (s *Store) CalculateAggregateTPM() float64 {
 	s.mu.RLock()

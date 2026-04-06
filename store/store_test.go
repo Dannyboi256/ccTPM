@@ -321,6 +321,82 @@ func TestNewTestRecordOverrides(t *testing.T) {
 	}
 }
 
+func TestRollingITPM_WindowBoundary(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	// Record that ended 59s ago — should count
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-59*time.Second)),
+		withTokens(1000, 0, 0, 0),
+	))
+	// Record that ended 61s ago — should NOT count
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-61*time.Second)),
+		withTokens(9999, 0, 0, 0),
+	))
+
+	got := s.RollingITPM("s1", now)
+	if got != 1000 {
+		t.Fatalf("expected ITPM=1000, got %v", got)
+	}
+}
+
+func TestRollingITPM_IncludesCacheCreationExcludesCacheRead(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(500, 9999, 200, 100000), // input=500, output=9999 (ignored for ITPM), cache_creation=200, cache_read=100000 (excluded)
+	))
+
+	got := s.RollingITPM("s1", now)
+	if got != 700 { // 500 + 200
+		t.Fatalf("expected ITPM=700 (input+cache_creation), got %v", got)
+	}
+}
+
+func TestRollingITPM_EmptySession(t *testing.T) {
+	s := NewStore()
+	got := s.RollingITPM("nonexistent", time.Now())
+	if got != 0 {
+		t.Fatalf("expected 0 for nonexistent session, got %v", got)
+	}
+}
+
+func TestRollingITPM_AllRecordsOutsideWindow(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Minute)),
+		withTokens(5000, 1000, 0, 0),
+	))
+	got := s.RollingITPM("s1", now)
+	if got != 0 {
+		t.Fatalf("expected 0 for all-outside-window, got %v", got)
+	}
+}
+
+func TestRollingITPM_InFlightExcluded(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(100, 0, 0, 0),
+	))
+	s.AddInFlight("s1", "/v1/messages")
+	got := s.RollingITPM("s1", now)
+	if got != 100 {
+		t.Fatalf("expected 100 (completed record counts, in-flight does not), got %v", got)
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
