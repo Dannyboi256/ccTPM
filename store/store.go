@@ -86,6 +86,50 @@ func NewStore() *Store {
 	}
 }
 
+func deepCopyRecord(r RequestRecord) RequestRecord {
+	if r.ITokensLimit != nil {
+		v := *r.ITokensLimit
+		r.ITokensLimit = &v
+	}
+	if r.ITokensRemaining != nil {
+		v := *r.ITokensRemaining
+		r.ITokensRemaining = &v
+	}
+	if r.OTokensLimit != nil {
+		v := *r.OTokensLimit
+		r.OTokensLimit = &v
+	}
+	if r.OTokensRemaining != nil {
+		v := *r.OTokensRemaining
+		r.OTokensRemaining = &v
+	}
+	if r.RPMLimit != nil {
+		v := *r.RPMLimit
+		r.RPMLimit = &v
+	}
+	if r.RPMRemaining != nil {
+		v := *r.RPMRemaining
+		r.RPMRemaining = &v
+	}
+	if r.Unified5hUtil != nil {
+		v := *r.Unified5hUtil
+		r.Unified5hUtil = &v
+	}
+	if r.Unified5hReset != nil {
+		v := *r.Unified5hReset
+		r.Unified5hReset = &v
+	}
+	if r.Unified7dUtil != nil {
+		v := *r.Unified7dUtil
+		r.Unified7dUtil = &v
+	}
+	if r.Unified7dReset != nil {
+		v := *r.Unified7dReset
+		r.Unified7dReset = &v
+	}
+	return r
+}
+
 func (s *Store) AddRecord(rec RequestRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,6 +143,7 @@ func (s *Store) AddRecord(rec RequestRecord) {
 		s.sessions[rec.SessionID] = sess
 	}
 	sess.LastSeen = rec.EndTime
+	rec = deepCopyRecord(rec)
 	sess.Requests = append(sess.Requests, rec)
 	if len(sess.Requests) > 1000 {
 		sess.Requests = sess.Requests[len(sess.Requests)-1000:]

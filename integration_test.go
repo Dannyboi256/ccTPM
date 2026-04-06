@@ -409,7 +409,7 @@ func TestIntegration_EndToEndTPMMeasurement(t *testing.T) {
 	}
 
 	// DB TPM bucket should show at least one bucket with the same total
-	buckets, err := d.QueryTPMBuckets(now.Add(-2*time.Minute), now.Add(1*time.Minute), 60)
+	buckets, err := d.QueryTPMBuckets(now.Add(-2*time.Minute), now.Add(1*time.Minute), 60, "")
 	if err != nil {
 		t.Fatal(err)
 	}

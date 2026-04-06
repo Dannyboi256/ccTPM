@@ -74,8 +74,8 @@ func TestRunTPM_BucketedTable(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:   base.Add(-1 * time.Minute).Format("2006-01-02 15:04:05"),
-		To:     base.Add(5 * time.Minute).Format("2006-01-02 15:04:05"),
+		From:   base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		To:     base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
 		Bucket: 60,
 		Writer: &buf,
 	})
@@ -106,8 +106,8 @@ func TestRunTPM_Peak(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:   base.Add(-1 * time.Minute).Format("2006-01-02 15:04:05"),
-		To:     base.Add(5 * time.Minute).Format("2006-01-02 15:04:05"),
+		From:   base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		To:     base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
 		Peak:   true,
 		Writer: &buf,
 	})
@@ -136,8 +136,8 @@ func TestRunTPM_PeakGroupBySession(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:    base.Add(-1 * time.Minute).Format("2006-01-02 15:04:05"),
-		To:      base.Add(5 * time.Minute).Format("2006-01-02 15:04:05"),
+		From:    base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		To:      base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
 		Peak:    true,
 		GroupBy: "session",
 		Writer:  &buf,
@@ -204,6 +204,79 @@ func TestRunTPM_GroupBySessionRequiresPeak(t *testing.T) {
 	}
 }
 
+func TestRunTPM_LocalTimeRange(t *testing.T) {
+	d, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Insert a record with a known EndTime
+	now := time.Now()
+	_ = d.InsertRecord(store.RequestRecord{
+		SessionID:   "s1",
+		StartTime:   now.Add(-5 * time.Second),
+		EndTime:     now,
+		InputTokens: 500,
+		StatusCode:  200,
+	})
+
+	// Query using local-time formatted strings that match the record
+	from := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
+	to := now.Add(1 * time.Minute).Format("2006-01-02 15:04:05")
+
+	var buf bytes.Buffer
+	err = RunQuery(d, "tpm", Opts{
+		From:   from,
+		To:     to,
+		Bucket: 60,
+		Writer: &buf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "500") {
+		t.Errorf("expected record to appear in local-time range, got %q", buf.String())
+	}
+}
+
+func TestRunTPM_SessionFilter(t *testing.T) {
+	d, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	base := time.Date(2026, 4, 5, 14, 0, 0, 0, time.UTC)
+	_ = d.InsertRecord(store.RequestRecord{
+		SessionID: "wanted", StartTime: base, EndTime: base.Add(5 * time.Second),
+		InputTokens: 1000, StatusCode: 200,
+	})
+	_ = d.InsertRecord(store.RequestRecord{
+		SessionID: "unwanted", StartTime: base, EndTime: base.Add(5 * time.Second),
+		InputTokens: 9999, StatusCode: 200,
+	})
+
+	var buf bytes.Buffer
+	err = RunQuery(d, "tpm", Opts{
+		From:      base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		To:        base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		Bucket:    60,
+		SessionID: "wanted",
+		Writer:    &buf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "1000") {
+		t.Errorf("expected wanted session ITPM=1000, got %q", out)
+	}
+	if strings.Contains(out, "9999") || strings.Contains(out, "10999") {
+		t.Errorf("unwanted session should be filtered out, got %q", out)
+	}
+}
+
 func TestRunTPM_BucketedDefaultLimitIsUnlimited(t *testing.T) {
 	d, err := db.Open(":memory:")
 	if err != nil {
@@ -226,8 +299,8 @@ func TestRunTPM_BucketedDefaultLimitIsUnlimited(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:   base.Add(-1 * time.Minute).Format("2006-01-02 15:04:05"),
-		To:     base.Add(20 * time.Minute).Format("2006-01-02 15:04:05"),
+		From:   base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		To:     base.Add(20 * time.Minute).Local().Format("2006-01-02 15:04:05"),
 		Bucket: 60, // 1-minute buckets
 		Limit:  0,  // default — should be unlimited for tpm bucketed
 		Writer: &buf,

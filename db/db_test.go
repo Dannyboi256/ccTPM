@@ -351,7 +351,7 @@ func TestQueryTPMBuckets_BasicShape(t *testing.T) {
 	// 1-minute buckets
 	from := base.Add(-1 * time.Second)
 	to := base.Add(5 * time.Minute)
-	buckets, err := d.QueryTPMBuckets(from, to, 60)
+	buckets, err := d.QueryTPMBuckets(from, to, 60, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestQueryTPMBuckets_EmptyRange(t *testing.T) {
 	}
 	defer d.Close()
 
-	buckets, err := d.QueryTPMBuckets(time.Now().Add(-1*time.Hour), time.Now(), 60)
+	buckets, err := d.QueryTPMBuckets(time.Now().Add(-1*time.Hour), time.Now(), 60, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestQueryTPMBuckets_BucketBoundaryGrouping(t *testing.T) {
 	_ = d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: at1500.Add(-1 * time.Second), EndTime: at1500, InputTokens: 200, StatusCode: 200})
 	_ = d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: at1501.Add(-1 * time.Second), EndTime: at1501, InputTokens: 300, StatusCode: 200})
 
-	buckets, err := d.QueryTPMBuckets(at1459.Add(-1*time.Minute), at1501.Add(1*time.Minute), 3600)
+	buckets, err := d.QueryTPMBuckets(at1459.Add(-1*time.Minute), at1501.Add(1*time.Minute), 3600, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestQueryTPMPeak_AllTime(t *testing.T) {
 	d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: base.Add(90 * time.Second), EndTime: base.Add(95 * time.Second), InputTokens: 500, OutputTokens: 200, StatusCode: 200})
 	d.InsertRecord(store.RequestRecord{SessionID: "s2", StartTime: base.Add(180 * time.Second), EndTime: base.Add(185 * time.Second), InputTokens: 300, OutputTokens: 50, StatusCode: 200})
 
-	peak, err := d.QueryTPMPeak(base.Add(-1*time.Minute), base.Add(10*time.Minute), "")
+	peak, err := d.QueryTPMPeak(base.Add(-1*time.Minute), base.Add(10*time.Minute), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,6 +457,40 @@ func TestQueryTPMPeak_AllTime(t *testing.T) {
 	}
 	if peak[0].MaxOTPM != 200 {
 		t.Errorf("MaxOTPM: want 200, got %v", peak[0].MaxOTPM)
+	}
+}
+
+func TestQueryTPMPeak_UngroupedAggregatesCrossSessions(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Two sessions with records in the SAME minute
+	base := time.Date(2026, 4, 5, 14, 0, 5, 0, time.UTC)
+	_ = d.InsertRecord(store.RequestRecord{
+		SessionID: "s1", StartTime: base.Add(-1 * time.Second), EndTime: base,
+		InputTokens: 1000, OutputTokens: 200, StatusCode: 200,
+	})
+	_ = d.InsertRecord(store.RequestRecord{
+		SessionID: "s2", StartTime: base.Add(-1 * time.Second), EndTime: base,
+		InputTokens: 500, OutputTokens: 100, StatusCode: 200,
+	})
+
+	peak, err := d.QueryTPMPeak(base.Add(-1*time.Minute), base.Add(1*time.Minute), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peak) != 1 {
+		t.Fatalf("expected 1 peak row, got %d", len(peak))
+	}
+	// Ungrouped peak should reflect the COMBINED minute: 1000+500=1500 ITPM, not max(1000,500)=1000
+	if peak[0].MaxITPM != 1500 {
+		t.Errorf("expected combined MaxITPM=1500, got %v (cross-session aggregation broken)", peak[0].MaxITPM)
+	}
+	if peak[0].MaxOTPM != 300 {
+		t.Errorf("expected combined MaxOTPM=300, got %v", peak[0].MaxOTPM)
 	}
 }
 
@@ -472,7 +506,7 @@ func TestQueryTPMPeak_GroupBySession(t *testing.T) {
 	d.InsertRecord(store.RequestRecord{SessionID: "s1", StartTime: base.Add(90 * time.Second), EndTime: base.Add(95 * time.Second), InputTokens: 500, OutputTokens: 200, StatusCode: 200})
 	d.InsertRecord(store.RequestRecord{SessionID: "s2", StartTime: base.Add(180 * time.Second), EndTime: base.Add(185 * time.Second), InputTokens: 300, OutputTokens: 50, StatusCode: 200})
 
-	peak, err := d.QueryTPMPeak(base.Add(-1*time.Minute), base.Add(10*time.Minute), "session")
+	peak, err := d.QueryTPMPeak(base.Add(-1*time.Minute), base.Add(10*time.Minute), "session", "")
 	if err != nil {
 		t.Fatal(err)
 	}

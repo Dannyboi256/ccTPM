@@ -140,14 +140,14 @@ func resolveTPMRange(opts Opts) (time.Time, time.Time, error) {
 	to := time.Now()
 	from := to.Add(-1 * time.Hour)
 	if opts.From != "" {
-		t, err := time.Parse("2006-01-02 15:04:05", opts.From)
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", opts.From, time.Local)
 		if err != nil {
 			return time.Time{}, time.Time{}, fmt.Errorf("invalid --from: %w", err)
 		}
 		from = t
 	}
 	if opts.To != "" {
-		t, err := time.Parse("2006-01-02 15:04:05", opts.To)
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", opts.To, time.Local)
 		if err != nil {
 			return time.Time{}, time.Time{}, fmt.Errorf("invalid --to: %w", err)
 		}
@@ -161,7 +161,7 @@ func runTPMBuckets(d *db.DB, w io.Writer, from, to time.Time, opts Opts) error {
 	if bucket <= 0 {
 		bucket = 300 // 5 minutes
 	}
-	buckets, err := d.QueryTPMBuckets(from, to, bucket)
+	buckets, err := d.QueryTPMBuckets(from, to, bucket, opts.SessionID)
 	if err != nil {
 		return err
 	}
@@ -179,7 +179,7 @@ func runTPMBuckets(d *db.DB, w io.Writer, from, to time.Time, opts Opts) error {
 }
 
 func runTPMPeak(d *db.DB, w io.Writer, from, to time.Time, opts Opts) error {
-	peaks, err := d.QueryTPMPeak(from, to, opts.GroupBy)
+	peaks, err := d.QueryTPMPeak(from, to, opts.GroupBy, opts.SessionID)
 	if err != nil {
 		return err
 	}

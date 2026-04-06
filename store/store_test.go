@@ -603,6 +603,32 @@ func TestRollingMetrics_ConcurrentReaders(t *testing.T) {
 	}
 }
 
+func TestAddRecord_DeepCopiesPointerFields(t *testing.T) {
+	s := NewStore()
+
+	iLimit := 450000
+	rec := RequestRecord{
+		SessionID:    "s1",
+		StartTime:    time.Now().Add(-1 * time.Second),
+		EndTime:      time.Now(),
+		StatusCode:   200,
+		ITokensLimit: &iLimit,
+	}
+	s.AddRecord(rec)
+
+	// Mutate the original pointer value
+	iLimit = 999999
+
+	// The store's copy should NOT be affected
+	sess := s.GetSession("s1")
+	if sess == nil || len(sess.Requests) != 1 {
+		t.Fatal("expected 1 request in session")
+	}
+	if sess.Requests[0].ITokensLimit == nil || *sess.Requests[0].ITokensLimit != 450000 {
+		t.Fatalf("expected store copy to be 450000 (not mutated), got %v", *sess.Requests[0].ITokensLimit)
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()

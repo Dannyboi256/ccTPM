@@ -444,14 +444,20 @@ type TPMPeak struct {
 // QueryTPMBuckets returns bucketed max-per-bucket ITPM/OTPM/RPM over the time range.
 // The inner aggregation groups by minute-of-end; the outer query groups those minutes
 // into the requested bucket size and picks the peak per bucket.
-func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket, error) {
+func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int, sessionID string) ([]TPMBucket, error) {
 	if bucketSeconds <= 0 {
 		bucketSeconds = 60
 	}
 	// end_time_epoch is an integer unix timestamp populated at insert time. We use it
 	// directly instead of strftime('%s', end_time) because modernc.org/sqlite stores
 	// time.Time values in a format SQLite's date functions cannot parse.
-	q := `
+	sessionFilter := ""
+	args := []any{from.UTC().Unix(), to.UTC().Unix()}
+	if sessionID != "" {
+		sessionFilter = "AND session_id = ?"
+		args = append(args, sessionID)
+	}
+	q := fmt.Sprintf(`
 		WITH minute_windows AS (
 			SELECT
 				(end_time_epoch / 60) * 60        AS minute_epoch,
@@ -461,6 +467,7 @@ func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket
 			FROM requests
 			WHERE end_time_epoch BETWEEN ? AND ?
 			  AND end_time_epoch IS NOT NULL
+			  %s
 			GROUP BY minute_epoch
 		)
 		SELECT
@@ -471,8 +478,9 @@ func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket
 			COUNT(*)               AS sample_minutes
 		FROM minute_windows
 		GROUP BY bucket_epoch
-		ORDER BY bucket_epoch ASC`
-	rows, err := d.conn.Query(q, from.UTC().Unix(), to.UTC().Unix(), bucketSeconds, bucketSeconds)
+		ORDER BY bucket_epoch ASC`, sessionFilter)
+	args = append(args, bucketSeconds, bucketSeconds)
+	rows, err := d.conn.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -507,15 +515,22 @@ func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket
 
 // QueryTPMPeak returns peak ITPM/OTPM/RPM over the time range. With groupBy="session",
 // returns one row per session. Otherwise returns a single row for the all-time peak.
-func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error) {
+func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string, sessionID string) ([]TPMPeak, error) {
 	if groupBy != "" && groupBy != "session" {
 		return nil, fmt.Errorf("unknown group-by: %q (valid: \"\", \"session\")", groupBy)
 	}
 
 	// Uses end_time_epoch (integer unix seconds) for the same reasons as QueryTPMBuckets.
+	sessionFilter := ""
+	args := []any{from.UTC().Unix(), to.UTC().Unix()}
+	if sessionID != "" {
+		sessionFilter = "AND session_id = ?"
+		args = append(args, sessionID)
+	}
+
 	var q string
 	if groupBy == "session" {
-		q = `
+		q = fmt.Sprintf(`
 			WITH minute_windows AS (
 				SELECT
 					session_id,
@@ -526,6 +541,7 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 				FROM requests
 				WHERE end_time_epoch BETWEEN ? AND ?
 				  AND end_time_epoch IS NOT NULL
+				  %s
 				GROUP BY session_id, minute_epoch
 			)
 			SELECT
@@ -537,12 +553,11 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 				MAX(minute_epoch)
 			FROM minute_windows
 			GROUP BY session_id
-			ORDER BY MAX(itpm) DESC`
+			ORDER BY MAX(itpm) DESC`, sessionFilter)
 	} else {
-		q = `
+		q = fmt.Sprintf(`
 			WITH minute_windows AS (
 				SELECT
-					session_id,
 					(end_time_epoch / 60) * 60        AS minute_epoch,
 					SUM(input_tokens + cache_creation) AS itpm,
 					SUM(output_tokens)                 AS otpm,
@@ -550,7 +565,8 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 				FROM requests
 				WHERE end_time_epoch BETWEEN ? AND ?
 				  AND end_time_epoch IS NOT NULL
-				GROUP BY session_id, minute_epoch
+				  %s
+				GROUP BY minute_epoch
 			)
 			SELECT
 				'',
@@ -559,10 +575,10 @@ func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error)
 				MAX(rpm),
 				MIN(minute_epoch),
 				MAX(minute_epoch)
-			FROM minute_windows`
+			FROM minute_windows`, sessionFilter)
 	}
 
-	rows, err := d.conn.Query(q, from.UTC().Unix(), to.UTC().Unix())
+	rows, err := d.conn.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
