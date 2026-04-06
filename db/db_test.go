@@ -326,6 +326,50 @@ func TestInsertAndQueryRecord_AllHeadersNil(t *testing.T) {
 	}
 }
 
+func TestSchemaMigration_BackfillsEndTimeEpoch(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Insert a record — end_time_epoch will be populated by InsertRecord.
+	// To simulate a pre-migration row, manually NULL out end_time_epoch.
+	now := time.Now()
+	rec := store.RequestRecord{
+		SessionID:   "s1",
+		StartTime:   now.Add(-5 * time.Second),
+		EndTime:     now,
+		InputTokens: 100,
+		StatusCode:  200,
+	}
+	if err := d.InsertRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate pre-migration state: NULL out the epoch
+	if _, err := d.conn.Exec(`UPDATE requests SET end_time_epoch = NULL`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-run createSchema — the backfill should populate end_time_epoch
+	if err := d.createSchema(); err != nil {
+		t.Fatal(err)
+	}
+
+	var epoch sql.NullInt64
+	if err := d.conn.QueryRow(`SELECT end_time_epoch FROM requests WHERE session_id = 's1'`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	if !epoch.Valid {
+		t.Fatal("expected end_time_epoch to be backfilled, got NULL")
+	}
+	// The epoch should be close to now.Unix()
+	diff := now.Unix() - epoch.Int64
+	if diff < -2 || diff > 2 {
+		t.Errorf("backfilled epoch off by %d seconds", diff)
+	}
+}
+
 func TestQueryTPMBuckets_BasicShape(t *testing.T) {
 	d, err := Open(":memory:")
 	if err != nil {

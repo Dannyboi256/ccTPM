@@ -73,13 +73,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.refreshSessionList()
-		// Compute current rolling metrics and update peaks for the visible session
-		// and for the aggregate. Peaks are stored in the Store under store.mu.
 		now := time.Now()
-		itpm := m.store.RollingITPM(m.currentSession, now)
-		otpm := m.store.RollingOTPM(m.currentSession, now)
-		rpm := m.store.RollingRPM(m.currentSession, now)
-		m.store.UpdateSessionPeaks(m.currentSession, itpm, otpm, rpm, now)
+
+		// Update peaks for ALL sessions, not just the current one
+		for _, sid := range m.sessionList {
+			itpm := m.store.RollingITPM(sid, now)
+			otpm := m.store.RollingOTPM(sid, now)
+			rpm := m.store.RollingRPM(sid, now)
+			m.store.UpdateSessionPeaks(sid, itpm, otpm, rpm, now)
+		}
 
 		aItpm := m.store.RollingAggregateITPM(now)
 		aOtpm := m.store.RollingAggregateOTPM(now)

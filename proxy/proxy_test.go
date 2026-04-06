@@ -336,3 +336,29 @@ func TestModifyResponsePopulatesAllHeaderFields(t *testing.T) {
 		t.Fatalf("UnifiedStatus not populated: %q", rec.UnifiedStatus)
 	}
 }
+
+func TestExtractRateLimitHeaders_LegacyXHeaderFallback(t *testing.T) {
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("X-Ratelimit-Requests-Remaining", "42")
+	resp.Header.Set("X-Ratelimit-Tokens-Remaining", "99000")
+
+	got := extractRateLimitHeaders(resp)
+	if got.RPMRemaining == nil || *got.RPMRemaining != 42 {
+		t.Fatalf("expected RPMRemaining=42 from X-Ratelimit fallback, got %v", got.RPMRemaining)
+	}
+	if got.LegacyTokensRemaining == nil || *got.LegacyTokensRemaining != 99000 {
+		t.Fatalf("expected LegacyTokensRemaining=99000 from X-Ratelimit fallback, got %v", got.LegacyTokensRemaining)
+	}
+}
+
+func TestExtractRateLimitHeaders_AnthropicOverridesLegacy(t *testing.T) {
+	// When both headers are present, the anthropic-ratelimit-* value wins.
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("anthropic-ratelimit-requests-remaining", "998")
+	resp.Header.Set("X-Ratelimit-Requests-Remaining", "42")
+
+	got := extractRateLimitHeaders(resp)
+	if got.RPMRemaining == nil || *got.RPMRemaining != 998 {
+		t.Fatalf("expected RPMRemaining=998 (anthropic wins over legacy), got %v", got.RPMRemaining)
+	}
+}

@@ -111,6 +111,43 @@ func (d *DB) createSchema() error {
 	if _, err := d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_end_time_epoch ON requests(end_time_epoch)`); err != nil {
 		return fmt.Errorf("create idx_requests_end_time_epoch: %w", err)
 	}
+
+	// Backfill end_time_epoch for rows inserted before this migration.
+	// We parse end_time in Go (not SQL) because modernc.org/sqlite stores
+	// time.Time in a format SQLite's strftime cannot parse.
+	rows, err := d.conn.Query(`SELECT id, end_time FROM requests WHERE end_time_epoch IS NULL`)
+	if err != nil {
+		return fmt.Errorf("backfill query: %w", err)
+	}
+	var updates []struct {
+		id    int64
+		epoch int64
+	}
+	for rows.Next() {
+		var id int64
+		var endTimeStr string
+		if err := rows.Scan(&id, &endTimeStr); err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill scan: %w", err)
+		}
+		t := parseTime(endTimeStr)
+		if !t.IsZero() {
+			updates = append(updates, struct {
+				id    int64
+				epoch int64
+			}{id, t.Unix()})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("backfill iterate: %w", err)
+	}
+	for _, u := range updates {
+		if _, err := d.conn.Exec(`UPDATE requests SET end_time_epoch = ? WHERE id = ?`, u.epoch, u.id); err != nil {
+			return fmt.Errorf("backfill update id=%d: %w", u.id, err)
+		}
+	}
+
 	return nil
 }
 

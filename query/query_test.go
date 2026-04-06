@@ -74,8 +74,8 @@ func TestRunTPM_BucketedTable(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:   base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
-		To:     base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		From:   base.Add(-1 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
+		To:     base.Add(5 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
 		Bucket: 60,
 		Writer: &buf,
 	})
@@ -106,8 +106,8 @@ func TestRunTPM_Peak(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:   base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
-		To:     base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		From:   base.Add(-1 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
+		To:     base.Add(5 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
 		Peak:   true,
 		Writer: &buf,
 	})
@@ -136,8 +136,8 @@ func TestRunTPM_PeakGroupBySession(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:    base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
-		To:      base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		From:    base.Add(-1 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
+		To:      base.Add(5 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
 		Peak:    true,
 		GroupBy: "session",
 		Writer:  &buf,
@@ -221,9 +221,9 @@ func TestRunTPM_LocalTimeRange(t *testing.T) {
 		StatusCode:  200,
 	})
 
-	// Query using local-time formatted strings that match the record
-	from := now.Add(-1 * time.Minute).Format("2006-01-02 15:04:05")
-	to := now.Add(1 * time.Minute).Format("2006-01-02 15:04:05")
+	// Query using UTC-formatted strings that match the record
+	from := now.Add(-1 * time.Minute).UTC().Format("2006-01-02 15:04:05")
+	to := now.Add(1 * time.Minute).UTC().Format("2006-01-02 15:04:05")
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
@@ -259,8 +259,8 @@ func TestRunTPM_SessionFilter(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:      base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
-		To:        base.Add(5 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		From:      base.Add(-1 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
+		To:        base.Add(5 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
 		Bucket:    60,
 		SessionID: "wanted",
 		Writer:    &buf,
@@ -299,8 +299,8 @@ func TestRunTPM_BucketedDefaultLimitIsUnlimited(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = RunQuery(d, "tpm", Opts{
-		From:   base.Add(-1 * time.Minute).Local().Format("2006-01-02 15:04:05"),
-		To:     base.Add(20 * time.Minute).Local().Format("2006-01-02 15:04:05"),
+		From:   base.Add(-1 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
+		To:     base.Add(20 * time.Minute).UTC().Format("2006-01-02 15:04:05"),
 		Bucket: 60, // 1-minute buckets
 		Limit:  0,  // default — should be unlimited for tpm bucketed
 		Writer: &buf,

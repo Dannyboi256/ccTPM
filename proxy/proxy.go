@@ -167,6 +167,15 @@ func extractRateLimitHeaders(resp *http.Response) RateLimitHeaders {
 	// Legacy combined tokens header — distinct from ITokensRemaining, do not conflate
 	out.LegacyTokensRemaining = parseIntHeader(h, "anthropic-ratelimit-tokens-remaining")
 
+	// Legacy X-Ratelimit-* fallback. Some proxies/gateways may still emit these.
+	// Only apply if the primary anthropic-ratelimit-* header was absent.
+	if out.RPMRemaining == nil {
+		out.RPMRemaining = parseIntHeader(h, "X-Ratelimit-Requests-Remaining")
+	}
+	if out.LegacyTokensRemaining == nil {
+		out.LegacyTokensRemaining = parseIntHeader(h, "X-Ratelimit-Tokens-Remaining")
+	}
+
 	// Unified OAuth headers
 	out.Unified5hUtil = parseFloatHeader(h, "anthropic-ratelimit-unified-5h-utilization")
 	out.Unified5hReset = parseUnixOrRFC3339(h, "anthropic-ratelimit-unified-5h-reset")

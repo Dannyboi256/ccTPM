@@ -140,14 +140,14 @@ func resolveTPMRange(opts Opts) (time.Time, time.Time, error) {
 	to := time.Now()
 	from := to.Add(-1 * time.Hour)
 	if opts.From != "" {
-		t, err := time.ParseInLocation("2006-01-02 15:04:05", opts.From, time.Local)
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", opts.From, time.UTC)
 		if err != nil {
 			return time.Time{}, time.Time{}, fmt.Errorf("invalid --from: %w", err)
 		}
 		from = t
 	}
 	if opts.To != "" {
-		t, err := time.ParseInLocation("2006-01-02 15:04:05", opts.To, time.Local)
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", opts.To, time.UTC)
 		if err != nil {
 			return time.Time{}, time.Time{}, fmt.Errorf("invalid --to: %w", err)
 		}
