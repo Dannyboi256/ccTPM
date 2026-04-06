@@ -203,3 +203,42 @@ func TestRunTPM_GroupBySessionRequiresPeak(t *testing.T) {
 		t.Errorf("expected bucketed output (GroupBy ignored), got %q", buf.String())
 	}
 }
+
+func TestRunTPM_BucketedDefaultLimitIsUnlimited(t *testing.T) {
+	d, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Insert 15 records, each one minute apart — should produce 15 distinct 1-minute buckets
+	base := time.Date(2026, 4, 5, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 15; i++ {
+		end := base.Add(time.Duration(i) * time.Minute)
+		_ = d.InsertRecord(store.RequestRecord{
+			SessionID:   "s1",
+			StartTime:   end.Add(-5 * time.Second),
+			EndTime:     end,
+			InputTokens: 100 * (i + 1), // distinct per bucket
+			StatusCode:  200,
+		})
+	}
+
+	var buf bytes.Buffer
+	err = RunQuery(d, "tpm", Opts{
+		From:   base.Add(-1 * time.Minute).Format("2006-01-02 15:04:05"),
+		To:     base.Add(20 * time.Minute).Format("2006-01-02 15:04:05"),
+		Bucket: 60, // 1-minute buckets
+		Limit:  0,  // default — should be unlimited for tpm bucketed
+		Writer: &buf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Count data rows (skip the header line)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	dataRows := len(lines) - 1
+	if dataRows < 15 {
+		t.Errorf("expected at least 15 bucket rows with unlimited default, got %d (output: %q)", dataRows, buf.String())
+	}
+}

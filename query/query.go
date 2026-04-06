@@ -46,6 +46,9 @@ func RunQuery(d *db.DB, queryType string, opts Opts) error {
 }
 
 func runSessions(d *db.DB, w io.Writer, limit int) error {
+	if limit <= 0 {
+		limit = 10
+	}
 	sessions, err := d.QuerySessions(limit)
 	if err != nil {
 		return err
@@ -62,6 +65,9 @@ func runSessions(d *db.DB, w io.Writer, limit int) error {
 }
 
 func runRequests(d *db.DB, w io.Writer, opts Opts) error {
+	if opts.Limit <= 0 {
+		opts.Limit = 10
+	}
 	rows, err := d.QueryRequests(opts.From, opts.To, opts.SessionID, opts.Limit)
 	if err != nil {
 		return err
@@ -79,6 +85,9 @@ func runRequests(d *db.DB, w io.Writer, opts Opts) error {
 }
 
 func runThrottle(d *db.DB, w io.Writer, opts Opts) error {
+	if opts.Limit <= 0 {
+		opts.Limit = 10
+	}
 	threshold := opts.TTFTThreshold
 	if threshold == 0 {
 		threshold = 5000
