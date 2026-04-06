@@ -180,6 +180,37 @@ func extractRateLimitHeaders(resp *http.Response) RateLimitHeaders {
 	return out
 }
 
+func applyRateLimitHeaders(rec *store.RequestRecord, h RateLimitHeaders) {
+	rec.RetryAfter = h.RetryAfter
+	rec.RateLimitReqRemaining = -1
+	if h.RPMRemaining != nil {
+		rec.RateLimitReqRemaining = *h.RPMRemaining
+	}
+	rec.RateLimitTokRemaining = -1
+	if h.LegacyTokensRemaining != nil {
+		rec.RateLimitTokRemaining = *h.LegacyTokensRemaining
+	}
+
+	rec.ITokensLimit = h.ITokensLimit
+	rec.ITokensRemaining = h.ITokensRemaining
+	rec.ITokensReset = h.ITokensReset
+	rec.OTokensLimit = h.OTokensLimit
+	rec.OTokensRemaining = h.OTokensRemaining
+	rec.OTokensReset = h.OTokensReset
+	rec.RPMLimit = h.RPMLimit
+	rec.RPMRemaining = h.RPMRemaining
+	rec.RPMReset = h.RPMReset
+
+	rec.Unified5hUtil = h.Unified5hUtil
+	rec.Unified5hReset = h.Unified5hReset
+	rec.Unified5hStatus = h.Unified5hStatus
+	rec.Unified7dUtil = h.Unified7dUtil
+	rec.Unified7dReset = h.Unified7dReset
+	rec.Unified7dStatus = h.Unified7dStatus
+	rec.UnifiedStatus = h.UnifiedStatus
+	rec.UnifiedReprClaim = h.UnifiedReprClaim
+}
+
 type Config struct {
 	UpstreamURL *url.URL
 	SessionName string
@@ -213,27 +244,16 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 		requestStart = time.Now()
 	}
 	rateHeaders := extractRateLimitHeaders(resp)
-	retryAfter := rateHeaders.RetryAfter
-	reqRemaining := -1
-	if rateHeaders.RPMRemaining != nil {
-		reqRemaining = *rateHeaders.RPMRemaining
-	}
-	tokRemaining := -1
-	if rateHeaders.LegacyTokensRemaining != nil {
-		tokRemaining = *rateHeaders.LegacyTokensRemaining
-	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		rec := store.RequestRecord{
-			StartTime:             requestStart,
-			EndTime:               time.Now(),
-			Endpoint:              endpoint,
-			StatusCode:            resp.StatusCode,
-			RetryAfter:            retryAfter,
-			RateLimitReqRemaining: reqRemaining,
-			RateLimitTokRemaining: tokRemaining,
-			SessionID:             sessionID,
+			StartTime:  requestStart,
+			EndTime:    time.Now(),
+			Endpoint:   endpoint,
+			StatusCode: resp.StatusCode,
+			SessionID:  sessionID,
 		}
+		applyRateLimitHeaders(&rec, rateHeaders)
 		cfg.Store.AddRecord(rec)
 		select {
 		case cfg.DBChan <- rec:
@@ -263,16 +283,14 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 				for range ch {
 				}
 				rec := store.RequestRecord{
-					StartTime:             requestStart,
-					EndTime:               time.Now(),
-					Endpoint:              endpoint,
-					StatusCode:            resp.StatusCode,
-					RetryAfter:            retryAfter,
-					RateLimitReqRemaining: reqRemaining,
-					RateLimitTokRemaining: tokRemaining,
-					HasError:              true,
-					SessionID:             sessionID,
+					StartTime:  requestStart,
+					EndTime:    time.Now(),
+					Endpoint:   endpoint,
+					StatusCode: resp.StatusCode,
+					HasError:   true,
+					SessionID:  sessionID,
 				}
+				applyRateLimitHeaders(&rec, rateHeaders)
 				cfg.Store.AddRecord(rec)
 				cfg.DBChan <- rec
 				return
@@ -298,22 +316,20 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 		endTime := time.Now()
 
 		rec := store.RequestRecord{
-			StartTime:             requestStart,
-			EndTime:               endTime,
-			Model:                 result.Model,
-			InputTokens:           result.InputTokens,
-			OutputTokens:          result.OutputTokens,
-			CacheCreation:         result.CacheCreation,
-			CacheRead:             result.CacheRead,
-			Endpoint:              endpoint,
-			StatusCode:            resp.StatusCode,
-			TTFT:                  trc.TTFT(),
-			RetryAfter:            retryAfter,
-			RateLimitReqRemaining: reqRemaining,
-			RateLimitTokRemaining: tokRemaining,
-			HasError:              result.HasError,
-			SessionID:             sessionID,
+			StartTime:    requestStart,
+			EndTime:      endTime,
+			Model:        result.Model,
+			InputTokens:  result.InputTokens,
+			OutputTokens: result.OutputTokens,
+			CacheCreation: result.CacheCreation,
+			CacheRead:    result.CacheRead,
+			Endpoint:     endpoint,
+			StatusCode:   resp.StatusCode,
+			TTFT:         trc.TTFT(),
+			HasError:     result.HasError,
+			SessionID:    sessionID,
 		}
+		applyRateLimitHeaders(&rec, rateHeaders)
 		cfg.Store.AddRecord(rec)
 		select {
 		case cfg.DBChan <- rec:

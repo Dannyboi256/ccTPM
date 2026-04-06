@@ -2,8 +2,11 @@ package proxy
 
 import (
 	"bytes"
+	"claude-proxy/store"
+	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -283,5 +286,53 @@ func TestExtractSessionID(t *testing.T) {
 				t.Fatalf("expected '%s', got '%s'", tt.want, got)
 			}
 		})
+	}
+}
+
+func TestModifyResponsePopulatesAllHeaderFields(t *testing.T) {
+	st := store.NewStore()
+	dbChan := make(chan store.RequestRecord, 16)
+	cfg := Config{
+		UpstreamURL: &url.URL{Scheme: "https", Host: "api.anthropic.com"},
+		SessionName: "test-session",
+		Store:       st,
+		DBChan:      dbChan,
+	}
+
+	body := `{"id":"msg_1","type":"message","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":50}}`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{},
+		Body:       io.NopCloser(bytes.NewReader([]byte(body))),
+		Request:    &http.Request{URL: &url.URL{Path: "/v1/messages"}, Header: http.Header{}},
+	}
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("anthropic-ratelimit-input-tokens-limit", "450000")
+	resp.Header.Set("anthropic-ratelimit-input-tokens-remaining", "448500")
+	resp.Header.Set("anthropic-ratelimit-unified-5h-utilization", "0.0184")
+	resp.Header.Set("anthropic-ratelimit-unified-status", "allowed")
+	resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), requestStartKey, time.Now()))
+
+	if err := modifyResponse(resp, cfg); err != nil {
+		t.Fatalf("modifyResponse: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var rec store.RequestRecord
+	select {
+	case rec = <-dbChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for DB record")
+	}
+
+	if rec.ITokensLimit == nil || *rec.ITokensLimit != 450000 {
+		t.Fatalf("ITokensLimit not populated: %v", rec.ITokensLimit)
+	}
+	if rec.Unified5hUtil == nil || *rec.Unified5hUtil < 0.018 {
+		t.Fatalf("Unified5hUtil not populated: %v", rec.Unified5hUtil)
+	}
+	if rec.UnifiedStatus != "allowed" {
+		t.Fatalf("UnifiedStatus not populated: %q", rec.UnifiedStatus)
 	}
 }
