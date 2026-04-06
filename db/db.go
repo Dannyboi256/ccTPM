@@ -419,3 +419,187 @@ func nullFloatToFloatPtr(n sql.NullFloat64) *float64 {
 	v := n.Float64
 	return &v
 }
+
+// TPMBucket is one row of the bucketed TPM query result.
+type TPMBucket struct {
+	BucketStart   time.Time // start of the bucket in UTC
+	MaxITPM       float64
+	MaxOTPM       float64
+	MaxRPM        int
+	SampleMinutes int // count of minute windows with data in this bucket
+}
+
+// TPMPeak is one row of the peak TPM query result.
+// For all-time peak (no group-by), SessionID is empty and one row is returned.
+// For group-by session, one row per session_id is returned.
+type TPMPeak struct {
+	SessionID string
+	MaxITPM   float64
+	MaxOTPM   float64
+	MaxRPM    int
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// QueryTPMBuckets returns bucketed max-per-bucket ITPM/OTPM/RPM over the time range.
+// The inner aggregation groups by minute-of-end; the outer query groups those minutes
+// into the requested bucket size and picks the peak per bucket.
+func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int) ([]TPMBucket, error) {
+	if bucketSeconds <= 0 {
+		bucketSeconds = 60
+	}
+	// end_time_epoch is an integer unix timestamp populated at insert time. We use it
+	// directly instead of strftime('%s', end_time) because modernc.org/sqlite stores
+	// time.Time values in a format SQLite's date functions cannot parse.
+	q := `
+		WITH minute_windows AS (
+			SELECT
+				(end_time_epoch / 60) * 60        AS minute_epoch,
+				SUM(input_tokens + cache_creation) AS itpm,
+				SUM(output_tokens)                 AS otpm,
+				COUNT(*)                           AS rpm
+			FROM requests
+			WHERE end_time_epoch BETWEEN ? AND ?
+			  AND end_time_epoch IS NOT NULL
+			GROUP BY minute_epoch
+		)
+		SELECT
+			(minute_epoch / ?) * ? AS bucket_epoch,
+			MAX(itpm)              AS max_itpm,
+			MAX(otpm)              AS max_otpm,
+			MAX(rpm)               AS max_rpm,
+			COUNT(*)               AS sample_minutes
+		FROM minute_windows
+		GROUP BY bucket_epoch
+		ORDER BY bucket_epoch ASC`
+	rows, err := d.conn.Query(q, from.UTC().Unix(), to.UTC().Unix(), bucketSeconds, bucketSeconds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TPMBucket
+	for rows.Next() {
+		var bucketEpoch int64
+		var maxITPM, maxOTPM sql.NullFloat64
+		var maxRPM sql.NullInt64
+		var samples int
+		if err := rows.Scan(&bucketEpoch, &maxITPM, &maxOTPM, &maxRPM, &samples); err != nil {
+			return nil, err
+		}
+		b := TPMBucket{
+			BucketStart:   time.Unix(bucketEpoch, 0).UTC(),
+			SampleMinutes: samples,
+		}
+		if maxITPM.Valid {
+			b.MaxITPM = maxITPM.Float64
+		}
+		if maxOTPM.Valid {
+			b.MaxOTPM = maxOTPM.Float64
+		}
+		if maxRPM.Valid {
+			b.MaxRPM = int(maxRPM.Int64)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// QueryTPMPeak returns peak ITPM/OTPM/RPM over the time range. With groupBy="session",
+// returns one row per session. Otherwise returns a single row for the all-time peak.
+func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string) ([]TPMPeak, error) {
+	if groupBy != "" && groupBy != "session" {
+		return nil, fmt.Errorf("unknown group-by: %q (valid: \"\", \"session\")", groupBy)
+	}
+
+	// Uses end_time_epoch (integer unix seconds) for the same reasons as QueryTPMBuckets.
+	var q string
+	if groupBy == "session" {
+		q = `
+			WITH minute_windows AS (
+				SELECT
+					session_id,
+					(end_time_epoch / 60) * 60        AS minute_epoch,
+					SUM(input_tokens + cache_creation) AS itpm,
+					SUM(output_tokens)                 AS otpm,
+					COUNT(*)                           AS rpm
+				FROM requests
+				WHERE end_time_epoch BETWEEN ? AND ?
+				  AND end_time_epoch IS NOT NULL
+				GROUP BY session_id, minute_epoch
+			)
+			SELECT
+				session_id,
+				MAX(itpm),
+				MAX(otpm),
+				MAX(rpm),
+				MIN(minute_epoch),
+				MAX(minute_epoch)
+			FROM minute_windows
+			GROUP BY session_id
+			ORDER BY MAX(itpm) DESC`
+	} else {
+		q = `
+			WITH minute_windows AS (
+				SELECT
+					session_id,
+					(end_time_epoch / 60) * 60        AS minute_epoch,
+					SUM(input_tokens + cache_creation) AS itpm,
+					SUM(output_tokens)                 AS otpm,
+					COUNT(*)                           AS rpm
+				FROM requests
+				WHERE end_time_epoch BETWEEN ? AND ?
+				  AND end_time_epoch IS NOT NULL
+				GROUP BY session_id, minute_epoch
+			)
+			SELECT
+				'',
+				MAX(itpm),
+				MAX(otpm),
+				MAX(rpm),
+				MIN(minute_epoch),
+				MAX(minute_epoch)
+			FROM minute_windows`
+	}
+
+	rows, err := d.conn.Query(q, from.UTC().Unix(), to.UTC().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TPMPeak
+	for rows.Next() {
+		var sessID sql.NullString
+		var maxITPM, maxOTPM sql.NullFloat64
+		var maxRPM sql.NullInt64
+		var minEpoch, maxEpoch sql.NullInt64
+		if err := rows.Scan(&sessID, &maxITPM, &maxOTPM, &maxRPM, &minEpoch, &maxEpoch); err != nil {
+			return nil, err
+		}
+		// Skip the all-zero row that the "no data" all-time query produces.
+		if !maxITPM.Valid && !maxOTPM.Valid && !maxRPM.Valid {
+			continue
+		}
+		p := TPMPeak{
+			SessionID: sessID.String,
+		}
+		if maxITPM.Valid {
+			p.MaxITPM = maxITPM.Float64
+		}
+		if maxOTPM.Valid {
+			p.MaxOTPM = maxOTPM.Float64
+		}
+		if maxRPM.Valid {
+			p.MaxRPM = int(maxRPM.Int64)
+		}
+		if minEpoch.Valid {
+			p.FirstSeen = time.Unix(minEpoch.Int64, 0).UTC()
+		}
+		if maxEpoch.Valid {
+			p.LastSeen = time.Unix(maxEpoch.Int64, 0).UTC()
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
