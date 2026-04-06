@@ -255,31 +255,6 @@ func (s *Store) GetActiveTime(sessionID string) time.Duration {
 	return sumDurations(merged)
 }
 
-// CalculateTPM returns the TPM for a specific session.
-// Returns 0 if session doesn't exist or has no active time.
-func (s *Store) CalculateTPM(sessionID string) float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sess, ok := s.sessions[sessionID]
-	if !ok {
-		return 0
-	}
-
-	intervals := s.collectIntervals(sessionID)
-	merged := mergeIntervals(intervals)
-	activeTime := sumDurations(merged)
-	if activeTime == 0 {
-		return 0
-	}
-
-	var totalTokens int
-	for _, r := range sess.Requests {
-		totalTokens += r.InputTokens + r.OutputTokens + r.CacheCreation + r.CacheRead
-	}
-	return float64(totalTokens) / activeTime.Minutes()
-}
-
 // RollingITPM returns the rolling 60-second ITPM (input tokens per minute) for a session.
 // A record contributes if its EndTime falls in (now-60s, now].
 // ITPM = Σ(InputTokens + CacheCreation) — matches Anthropic's documented ITPM definition.
@@ -458,23 +433,3 @@ func (s *Store) GetAggregatePeaks() SessionPeaks {
 	return s.aggregatePeaks
 }
 
-// CalculateAggregateTPM returns the TPM across all sessions.
-func (s *Store) CalculateAggregateTPM() float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	intervals := s.collectIntervals("")
-	merged := mergeIntervals(intervals)
-	activeTime := sumDurations(merged)
-	if activeTime == 0 {
-		return 0
-	}
-
-	var totalTokens int
-	for _, sess := range s.sessions {
-		for _, r := range sess.Requests {
-			totalTokens += r.InputTokens + r.OutputTokens + r.CacheCreation + r.CacheRead
-		}
-	}
-	return float64(totalTokens) / activeTime.Minutes()
-}
