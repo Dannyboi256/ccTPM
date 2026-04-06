@@ -72,10 +72,11 @@ type InFlightReq struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	inflight map[uint64]InFlightReq
-	nextID   atomic.Uint64
+	mu             sync.RWMutex
+	sessions       map[string]*Session
+	inflight       map[uint64]InFlightReq
+	nextID         atomic.Uint64
+	aggregatePeaks SessionPeaks
 }
 
 func NewStore() *Store {
@@ -429,6 +430,32 @@ func (s *Store) GetSessionPeaks(sessionID string) SessionPeaks {
 		return SessionPeaks{}
 	}
 	return sess.Peaks
+}
+
+// UpdateAggregatePeaks updates the store-wide peak ITPM/OTPM/RPM using compare-and-swap logic.
+// Each metric is updated only if the new value exceeds the stored aggregate peak.
+func (s *Store) UpdateAggregatePeaks(itpm, otpm float64, rpm int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if itpm > s.aggregatePeaks.MaxITPM {
+		s.aggregatePeaks.MaxITPM = itpm
+		s.aggregatePeaks.MaxITPMTime = now
+	}
+	if otpm > s.aggregatePeaks.MaxOTPM {
+		s.aggregatePeaks.MaxOTPM = otpm
+		s.aggregatePeaks.MaxOTPMTime = now
+	}
+	if rpm > s.aggregatePeaks.MaxRPM {
+		s.aggregatePeaks.MaxRPM = rpm
+		s.aggregatePeaks.MaxRPMTime = now
+	}
+}
+
+// GetAggregatePeaks returns a snapshot of the store-wide peak metrics.
+func (s *Store) GetAggregatePeaks() SessionPeaks {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.aggregatePeaks
 }
 
 // CalculateAggregateTPM returns the TPM across all sessions.

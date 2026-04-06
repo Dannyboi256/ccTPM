@@ -579,6 +579,60 @@ func TestSessionPeaks_NonexistentSession(t *testing.T) {
 	}
 }
 
+func TestAggregatePeaks_TrackAcrossSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	peaks := s.GetAggregatePeaks()
+	if peaks.MaxITPM != 0 || peaks.MaxOTPM != 0 || peaks.MaxRPM != 0 {
+		t.Fatalf("expected zero peaks initially, got %+v", peaks)
+	}
+
+	s.UpdateAggregatePeaks(1000, 200, 15, now)
+	peaks = s.GetAggregatePeaks()
+	if peaks.MaxITPM != 1000 || peaks.MaxOTPM != 200 || peaks.MaxRPM != 15 {
+		t.Fatalf("expected (1000,200,15), got %+v", peaks)
+	}
+
+	s.UpdateAggregatePeaks(500, 50, 5, now.Add(time.Second))
+	peaks = s.GetAggregatePeaks()
+	if peaks.MaxITPM != 1000 {
+		t.Fatalf("expected MaxITPM=1000 unchanged, got %v", peaks.MaxITPM)
+	}
+}
+
+func TestAggregatePeaks_MultipleSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(400, 80, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(300, 60, 0, 0),
+	))
+
+	aItpm := s.RollingAggregateITPM(now)
+	aOtpm := s.RollingAggregateOTPM(now)
+	aRpm := s.RollingAggregateRPM(now)
+	s.UpdateAggregatePeaks(aItpm, aOtpm, aRpm, now)
+
+	peaks := s.GetAggregatePeaks()
+	if peaks.MaxITPM != 700 {
+		t.Errorf("expected aggregate MaxITPM=700 (sum across sessions), got %v", peaks.MaxITPM)
+	}
+	if peaks.MaxOTPM != 140 {
+		t.Errorf("expected aggregate MaxOTPM=140, got %v", peaks.MaxOTPM)
+	}
+	if peaks.MaxRPM != 2 {
+		t.Errorf("expected aggregate MaxRPM=2, got %d", peaks.MaxRPM)
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
