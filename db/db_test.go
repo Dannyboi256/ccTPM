@@ -213,3 +213,115 @@ func TestSchemaMigration_Idempotent(t *testing.T) {
 		t.Fatalf("second createSchema call failed: %v", err)
 	}
 }
+
+func TestInsertAndQueryRecord_WithHeaderFields(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	iLimit := 450000
+	iRemaining := 448500
+	fiveHUtil := 0.0184
+	fiveHReset := int64(1712345678)
+
+	now := time.Now()
+	rec := store.RequestRecord{
+		SessionID:        "s1",
+		StartTime:        now.Add(-5 * time.Second),
+		EndTime:          now,
+		Model:            "claude-sonnet-4",
+		StatusCode:       200,
+		InputTokens:      1000,
+		OutputTokens:     200,
+		ITokensLimit:     &iLimit,
+		ITokensRemaining: &iRemaining,
+		ITokensReset:     "2026-04-05T14:30:00Z",
+		Unified5hUtil:    &fiveHUtil,
+		Unified5hReset:   &fiveHReset,
+		UnifiedStatus:    "allowed",
+		UnifiedReprClaim: "five_hour",
+	}
+	if err := d.InsertRecord(rec); err != nil {
+		t.Fatalf("InsertRecord: %v", err)
+	}
+
+	rows, err := d.QueryRequests("", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	got := rows[0]
+	if got.ITokensLimit == nil || *got.ITokensLimit != 450000 {
+		t.Errorf("ITokensLimit wrong: %v", got.ITokensLimit)
+	}
+	if got.ITokensRemaining == nil || *got.ITokensRemaining != 448500 {
+		t.Errorf("ITokensRemaining wrong: %v", got.ITokensRemaining)
+	}
+	if got.ITokensReset != "2026-04-05T14:30:00Z" {
+		t.Errorf("ITokensReset wrong: %q", got.ITokensReset)
+	}
+	if got.Unified5hUtil == nil || *got.Unified5hUtil != 0.0184 {
+		t.Errorf("Unified5hUtil wrong: %v", got.Unified5hUtil)
+	}
+	if got.Unified5hReset == nil || *got.Unified5hReset != 1712345678 {
+		t.Errorf("Unified5hReset wrong: %v", got.Unified5hReset)
+	}
+	if got.UnifiedStatus != "allowed" {
+		t.Errorf("UnifiedStatus wrong: %q", got.UnifiedStatus)
+	}
+	if got.UnifiedReprClaim != "five_hour" {
+		t.Errorf("UnifiedReprClaim wrong: %q", got.UnifiedReprClaim)
+	}
+}
+
+func TestInsertAndQueryRecord_AllHeadersNil(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	rec := store.RequestRecord{
+		SessionID:  "s1",
+		StartTime:  time.Now().Add(-1 * time.Second),
+		EndTime:    time.Now(),
+		Model:      "m",
+		StatusCode: 200,
+	}
+	if err := d.InsertRecord(rec); err != nil {
+		t.Fatalf("InsertRecord: %v", err)
+	}
+	rows, err := d.QueryRequests("", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	got := rows[0]
+	if got.ITokensLimit != nil {
+		t.Errorf("expected nil ITokensLimit, got %v", *got.ITokensLimit)
+	}
+	if got.OTokensLimit != nil {
+		t.Errorf("expected nil OTokensLimit, got %v", *got.OTokensLimit)
+	}
+	if got.RPMLimit != nil {
+		t.Errorf("expected nil RPMLimit, got %v", *got.RPMLimit)
+	}
+	if got.Unified5hUtil != nil {
+		t.Errorf("expected nil Unified5hUtil, got %v", *got.Unified5hUtil)
+	}
+	if got.Unified7dUtil != nil {
+		t.Errorf("expected nil Unified7dUtil, got %v", *got.Unified7dUtil)
+	}
+	if got.UnifiedStatus != "" {
+		t.Errorf("expected empty UnifiedStatus, got %q", got.UnifiedStatus)
+	}
+	if got.UnifiedReprClaim != "" {
+		t.Errorf("expected empty UnifiedReprClaim, got %q", got.UnifiedReprClaim)
+	}
+}

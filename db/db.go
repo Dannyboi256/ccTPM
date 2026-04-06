@@ -117,16 +117,58 @@ func (d *DB) createSchema() error {
 func (d *DB) InsertRecord(rec store.RequestRecord) error {
 	_, err := d.conn.Exec(`
 		INSERT INTO requests (
-			session_id, start_time, end_time, model, endpoint, status_code,
+			session_id, start_time, end_time, end_time_epoch, model, endpoint, status_code,
 			input_tokens, output_tokens, cache_creation, cache_read,
-			ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.SessionID, rec.StartTime.UTC(), rec.EndTime.UTC(), rec.Model, rec.Endpoint, rec.StatusCode,
+			ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
+			itokens_limit, itokens_remaining, itokens_reset,
+			otokens_limit, otokens_remaining, otokens_reset,
+			rpm_limit, rpm_remaining, rpm_reset,
+			unified_5h_util, unified_5h_reset, unified_5h_status,
+			unified_7d_util, unified_7d_reset, unified_7d_status,
+			unified_status, unified_repr_claim
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.SessionID, rec.StartTime.UTC(), rec.EndTime.UTC(), rec.EndTime.UTC().Unix(),
+		rec.Model, rec.Endpoint, rec.StatusCode,
 		rec.InputTokens, rec.OutputTokens, rec.CacheCreation, rec.CacheRead,
 		rec.TTFT.Milliseconds(), rec.RetryAfter, rec.RateLimitReqRemaining, rec.RateLimitTokRemaining,
 		boolToInt(rec.HasError),
+		intPtrToNullInt(rec.ITokensLimit), intPtrToNullInt(rec.ITokensRemaining), stringToNullString(rec.ITokensReset),
+		intPtrToNullInt(rec.OTokensLimit), intPtrToNullInt(rec.OTokensRemaining), stringToNullString(rec.OTokensReset),
+		intPtrToNullInt(rec.RPMLimit), intPtrToNullInt(rec.RPMRemaining), stringToNullString(rec.RPMReset),
+		floatPtrToNullFloat(rec.Unified5hUtil), int64PtrToNullInt(rec.Unified5hReset), stringToNullString(rec.Unified5hStatus),
+		floatPtrToNullFloat(rec.Unified7dUtil), int64PtrToNullInt(rec.Unified7dReset), stringToNullString(rec.Unified7dStatus),
+		stringToNullString(rec.UnifiedStatus), stringToNullString(rec.UnifiedReprClaim),
 	)
 	return err
+}
+
+func intPtrToNullInt(p *int) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*p), Valid: true}
+}
+
+func int64PtrToNullInt(p *int64) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *p, Valid: true}
+}
+
+func floatPtrToNullFloat(p *float64) sql.NullFloat64 {
+	if p == nil {
+		return sql.NullFloat64{}
+	}
+	return sql.NullFloat64{Float64: *p, Valid: true}
+}
+
+func stringToNullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 func boolToInt(b bool) int {
@@ -137,7 +179,16 @@ func boolToInt(b bool) int {
 }
 
 func (d *DB) QueryRequests(from, to, sessionID string, limit int) ([]store.RequestRecord, error) {
-	q := "SELECT session_id, start_time, end_time, model, endpoint, status_code, input_tokens, output_tokens, cache_creation, cache_read, ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error FROM requests WHERE 1=1"
+	q := `SELECT session_id, start_time, end_time, model, endpoint, status_code,
+		input_tokens, output_tokens, cache_creation, cache_read,
+		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
+		itokens_limit, itokens_remaining, itokens_reset,
+		otokens_limit, otokens_remaining, otokens_reset,
+		rpm_limit, rpm_remaining, rpm_reset,
+		unified_5h_util, unified_5h_reset, unified_5h_status,
+		unified_7d_util, unified_7d_reset, unified_7d_status,
+		unified_status, unified_repr_claim
+		FROM requests WHERE 1=1`
 	var args []any
 	if from != "" {
 		q += " AND start_time >= ?"
@@ -202,7 +253,13 @@ func (d *DB) QuerySessions(limit int) ([]SessionSummary, error) {
 func (d *DB) QueryThrottle(ttftThresholdMs int, from, to, sessionID string, limit int) ([]store.RequestRecord, error) {
 	q := `SELECT session_id, start_time, end_time, model, endpoint, status_code,
 		input_tokens, output_tokens, cache_creation, cache_read,
-		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error
+		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
+		itokens_limit, itokens_remaining, itokens_reset,
+		otokens_limit, otokens_remaining, otokens_reset,
+		rpm_limit, rpm_remaining, rpm_reset,
+		unified_5h_util, unified_5h_reset, unified_5h_status,
+		unified_7d_util, unified_7d_reset, unified_7d_status,
+		unified_status, unified_repr_claim
 		FROM requests WHERE (status_code IN (429, 529) OR has_error = 1 OR ttft_ms > ?)`
 	args := []any{ttftThresholdMs}
 	if from != "" {
@@ -292,10 +349,22 @@ func scanRecords(rows *sql.Rows) ([]store.RequestRecord, error) {
 		var ttftMs int64
 		var hasErr int
 		var startTime, endTime string
+		var iLimit, iRemaining, oLimit, oRemaining, rLimit, rRemaining sql.NullInt64
+		var iReset, oReset, rReset sql.NullString
+		var u5hUtil, u7dUtil sql.NullFloat64
+		var u5hReset, u7dReset sql.NullInt64
+		var u5hStatus, u7dStatus, uStatus, uReprClaim sql.NullString
+
 		if err := rows.Scan(
 			&r.SessionID, &startTime, &endTime, &r.Model, &r.Endpoint, &r.StatusCode,
 			&r.InputTokens, &r.OutputTokens, &r.CacheCreation, &r.CacheRead,
 			&ttftMs, &r.RetryAfter, &r.RateLimitReqRemaining, &r.RateLimitTokRemaining, &hasErr,
+			&iLimit, &iRemaining, &iReset,
+			&oLimit, &oRemaining, &oReset,
+			&rLimit, &rRemaining, &rReset,
+			&u5hUtil, &u5hReset, &u5hStatus,
+			&u7dUtil, &u7dReset, &u7dStatus,
+			&uStatus, &uReprClaim,
 		); err != nil {
 			return nil, err
 		}
@@ -303,7 +372,50 @@ func scanRecords(rows *sql.Rows) ([]store.RequestRecord, error) {
 		r.EndTime = parseTime(endTime)
 		r.TTFT = time.Duration(ttftMs) * time.Millisecond
 		r.HasError = hasErr != 0
+
+		r.ITokensLimit = nullIntToIntPtr(iLimit)
+		r.ITokensRemaining = nullIntToIntPtr(iRemaining)
+		r.ITokensReset = iReset.String
+		r.OTokensLimit = nullIntToIntPtr(oLimit)
+		r.OTokensRemaining = nullIntToIntPtr(oRemaining)
+		r.OTokensReset = oReset.String
+		r.RPMLimit = nullIntToIntPtr(rLimit)
+		r.RPMRemaining = nullIntToIntPtr(rRemaining)
+		r.RPMReset = rReset.String
+		r.Unified5hUtil = nullFloatToFloatPtr(u5hUtil)
+		r.Unified5hReset = nullIntToInt64Ptr(u5hReset)
+		r.Unified5hStatus = u5hStatus.String
+		r.Unified7dUtil = nullFloatToFloatPtr(u7dUtil)
+		r.Unified7dReset = nullIntToInt64Ptr(u7dReset)
+		r.Unified7dStatus = u7dStatus.String
+		r.UnifiedStatus = uStatus.String
+		r.UnifiedReprClaim = uReprClaim.String
+
 		records = append(records, r)
 	}
 	return records, rows.Err()
+}
+
+func nullIntToIntPtr(n sql.NullInt64) *int {
+	if !n.Valid {
+		return nil
+	}
+	v := int(n.Int64)
+	return &v
+}
+
+func nullIntToInt64Ptr(n sql.NullInt64) *int64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Int64
+	return &v
+}
+
+func nullFloatToFloatPtr(n sql.NullFloat64) *float64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Float64
+	return &v
 }
