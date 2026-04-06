@@ -465,6 +465,73 @@ func TestRollingRPM_EmptySession(t *testing.T) {
 	}
 }
 
+func TestRollingAggregateITPM_SumsAllSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(1000, 200, 50, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-20*time.Second)),
+		withTokens(500, 100, 25, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s3"),
+		withEndTime(now.Add(-70*time.Second)), // outside window
+		withTokens(9999, 9999, 9999, 0),
+	))
+
+	got := s.RollingAggregateITPM(now)
+	want := float64(1000 + 50 + 500 + 25) // 1575
+	if got != want {
+		t.Fatalf("expected aggregate ITPM=%v, got %v", want, got)
+	}
+}
+
+func TestRollingAggregateOTPM(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(0, 300, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(0, 150, 0, 0),
+	))
+	got := s.RollingAggregateOTPM(now)
+	if got != 450 {
+		t.Fatalf("expected aggregate OTPM=450, got %v", got)
+	}
+}
+
+func TestRollingAggregateRPM(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		s.AddRecord(newTestRecord(
+			withSession("s1"),
+			withEndTime(now.Add(time.Duration(-i*5)*time.Second)),
+		))
+	}
+	for i := 0; i < 2; i++ {
+		s.AddRecord(newTestRecord(
+			withSession("s2"),
+			withEndTime(now.Add(time.Duration(-i*5)*time.Second)),
+		))
+	}
+	got := s.RollingAggregateRPM(now)
+	if got != 5 {
+		t.Fatalf("expected aggregate RPM=5, got %d", got)
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()

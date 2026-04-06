@@ -332,6 +332,57 @@ func (s *Store) RollingRPM(sessionID string, now time.Time) int {
 	return count
 }
 
+// RollingAggregateITPM returns rolling 60s ITPM across all sessions in the store.
+func (s *Store) RollingAggregateITPM(now time.Time) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, sess := range s.sessions {
+		for _, r := range sess.Requests {
+			if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+				total += r.InputTokens + r.CacheCreation
+			}
+		}
+	}
+	return float64(total)
+}
+
+// RollingAggregateOTPM returns rolling 60s OTPM across all sessions.
+func (s *Store) RollingAggregateOTPM(now time.Time) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, sess := range s.sessions {
+		for _, r := range sess.Requests {
+			if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+				total += r.OutputTokens
+			}
+		}
+	}
+	return float64(total)
+}
+
+// RollingAggregateRPM returns rolling 60s RPM across all sessions.
+func (s *Store) RollingAggregateRPM(now time.Time) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	windowStart := now.Add(-60 * time.Second)
+	count := 0
+	for _, sess := range s.sessions {
+		for _, r := range sess.Requests {
+			if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 // CalculateAggregateTPM returns the TPM across all sessions.
 func (s *Store) CalculateAggregateTPM() float64 {
 	s.mu.RLock()
