@@ -4,6 +4,7 @@ import (
 	"claude-proxy/store"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -70,7 +71,47 @@ func (d *DB) createSchema() error {
 		CREATE INDEX IF NOT EXISTS idx_requests_start_time ON requests(start_time);
 		CREATE INDEX IF NOT EXISTS idx_requests_status_code_time ON requests(status_code, start_time);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Additive migration for the ITPM/OTPM/RPM design. Each ALTER TABLE is idempotent
+	// via duplicate-column error tolerance so repeated startup is safe.
+	// end_time_epoch is required because modernc.org/sqlite stores time.Time values
+	// in a format SQLite's strftime() cannot parse. See spec for details.
+	alters := []string{
+		`ALTER TABLE requests ADD COLUMN end_time_epoch      INTEGER`,
+		`ALTER TABLE requests ADD COLUMN itokens_limit       INTEGER`,
+		`ALTER TABLE requests ADD COLUMN itokens_remaining   INTEGER`,
+		`ALTER TABLE requests ADD COLUMN itokens_reset       TEXT`,
+		`ALTER TABLE requests ADD COLUMN otokens_limit       INTEGER`,
+		`ALTER TABLE requests ADD COLUMN otokens_remaining   INTEGER`,
+		`ALTER TABLE requests ADD COLUMN otokens_reset       TEXT`,
+		`ALTER TABLE requests ADD COLUMN rpm_limit           INTEGER`,
+		`ALTER TABLE requests ADD COLUMN rpm_remaining       INTEGER`,
+		`ALTER TABLE requests ADD COLUMN rpm_reset           TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_5h_util     REAL`,
+		`ALTER TABLE requests ADD COLUMN unified_5h_reset    INTEGER`,
+		`ALTER TABLE requests ADD COLUMN unified_5h_status   TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_7d_util     REAL`,
+		`ALTER TABLE requests ADD COLUMN unified_7d_reset    INTEGER`,
+		`ALTER TABLE requests ADD COLUMN unified_7d_status   TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_status      TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_repr_claim  TEXT`,
+	}
+	for _, stmt := range alters {
+		if _, err := d.conn.Exec(stmt); err != nil {
+			// SQLite returns "duplicate column name: X" if the column exists. Ignore that.
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return fmt.Errorf("migration failed (%s): %w", stmt, err)
+			}
+		}
+	}
+	// Index on end_time_epoch for TPM bucket queries.
+	if _, err := d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_end_time_epoch ON requests(end_time_epoch)`); err != nil {
+		return fmt.Errorf("create idx_requests_end_time_epoch: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) InsertRecord(rec store.RequestRecord) error {
