@@ -397,6 +397,74 @@ func TestRollingITPM_InFlightExcluded(t *testing.T) {
 	}
 }
 
+func TestRollingOTPM_OutputOnly(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(9999, 250, 9999, 9999), // only output (250) should count
+	))
+
+	got := s.RollingOTPM("s1", now)
+	if got != 250 {
+		t.Fatalf("expected OTPM=250 (output only), got %v", got)
+	}
+}
+
+func TestRollingOTPM_WindowBoundary(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-59*time.Second)),
+		withTokens(0, 100, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-61*time.Second)),
+		withTokens(0, 9999, 0, 0),
+	))
+	got := s.RollingOTPM("s1", now)
+	if got != 100 {
+		t.Fatalf("expected OTPM=100, got %v", got)
+	}
+}
+
+func TestRollingRPM_CountsRequests(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(1000, 200, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-20*time.Second)),
+		withTokens(0, 0, 0, 0), // zero-token error response still counts
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-70*time.Second)), // outside window
+		withTokens(1000, 200, 0, 0),
+	))
+
+	got := s.RollingRPM("s1", now)
+	if got != 2 {
+		t.Fatalf("expected RPM=2, got %d", got)
+	}
+}
+
+func TestRollingRPM_EmptySession(t *testing.T) {
+	s := NewStore()
+	if s.RollingRPM("nope", time.Now()) != 0 {
+		t.Fatal("expected 0 for empty session")
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()

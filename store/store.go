@@ -292,6 +292,46 @@ func (s *Store) RollingITPM(sessionID string, now time.Time) float64 {
 	return float64(total)
 }
 
+// RollingOTPM returns the rolling 60-second OTPM (output tokens per minute) for a session.
+// Uses end-time attribution. In-flight requests are excluded.
+func (s *Store) RollingOTPM(sessionID string, now time.Time) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return 0
+	}
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, r := range sess.Requests {
+		if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+			total += r.OutputTokens
+		}
+	}
+	return float64(total)
+}
+
+// RollingRPM returns the rolling 60-second RPM (requests per minute) for a session.
+// Counts all records (including zero-token error responses) whose EndTime falls in the window.
+func (s *Store) RollingRPM(sessionID string, now time.Time) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return 0
+	}
+	windowStart := now.Add(-60 * time.Second)
+	count := 0
+	for _, r := range sess.Requests {
+		if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+			count++
+		}
+	}
+	return count
+}
+
 // CalculateAggregateTPM returns the TPM across all sessions.
 func (s *Store) CalculateAggregateTPM() float64 {
 	s.mu.RLock()
