@@ -73,6 +73,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.refreshSessionList()
+		// Compute current rolling metrics and update peaks for the visible session
+		// and for the aggregate. Peaks are stored in the Store under store.mu.
+		now := time.Now()
+		itpm := m.store.RollingITPM(m.currentSession, now)
+		otpm := m.store.RollingOTPM(m.currentSession, now)
+		rpm := m.store.RollingRPM(m.currentSession, now)
+		m.store.UpdateSessionPeaks(m.currentSession, itpm, otpm, rpm, now)
+
+		aItpm := m.store.RollingAggregateITPM(now)
+		aOtpm := m.store.RollingAggregateOTPM(now)
+		aRpm := m.store.RollingAggregateRPM(now)
+		m.store.UpdateAggregatePeaks(aItpm, aOtpm, aRpm, now)
+
 		return m, tea.Tick(time.Second, func(t time.Time) tea.Msg {
 			return tickMsg(t)
 		})
@@ -136,6 +149,30 @@ func (m Model) renderSessionPane(sess *store.Session, inflight map[uint64]store.
 	b.WriteString(statLabelStyle.Render(fmt.Sprintf("  Duration: %s (active: %s)", uptime, activeStr)))
 	b.WriteString("\n")
 
+	now := time.Now()
+	itpm := m.store.RollingITPM(m.currentSession, now)
+	otpm := m.store.RollingOTPM(m.currentSession, now)
+	rpm := m.store.RollingRPM(m.currentSession, now)
+	peaks := m.store.GetSessionPeaks(m.currentSession)
+
+	hasData := sess != nil && len(sess.Requests) > 0
+	b.WriteString(fmt.Sprintf("  ITPM  |  current: %s     peak: %s  %s\n",
+		formatRateFloat(itpm, hasData),
+		formatRateFloat(peaks.MaxITPM, peaks.MaxITPM > 0),
+		formatPeakTime(peaks.MaxITPMTime),
+	))
+	b.WriteString(fmt.Sprintf("  OTPM  |  current: %s     peak: %s  %s\n",
+		formatRateFloat(otpm, hasData),
+		formatRateFloat(peaks.MaxOTPM, peaks.MaxOTPM > 0),
+		formatPeakTime(peaks.MaxOTPMTime),
+	))
+	b.WriteString(fmt.Sprintf("  RPM   |  current: %s     peak: %s  %s\n",
+		formatRateInt(rpm, hasData),
+		formatRateInt(peaks.MaxRPM, peaks.MaxRPM > 0),
+		formatPeakTime(peaks.MaxRPMTime),
+	))
+
+	// Secondary totals line — cumulative counters for visibility
 	var inputTok, outputTok, cacheRead, cacheCreate, reqCount int
 	var totalLatency time.Duration
 	if sess != nil {
@@ -148,32 +185,45 @@ func (m Model) renderSessionPane(sess *store.Session, inflight map[uint64]store.
 		}
 		reqCount = len(sess.Requests)
 	}
-	totalTok := inputTok + outputTok + cacheRead + cacheCreate
-
-	tpm := m.store.CalculateTPM(m.currentSession)
-	tpmStr := "--"
-	if tpm > 0 {
-		tpmStr = fmt.Sprintf("%.0f", tpm)
-	}
-
 	avgLatency := "--"
 	if reqCount > 0 {
 		avgLatency = fmt.Sprintf("%.1fs", (totalLatency / time.Duration(reqCount)).Seconds())
 	}
 
-	b.WriteString(fmt.Sprintf(" In: %s  Out: %s  Cache-R: %s  Cache-W: %s\n",
+	b.WriteString(fmt.Sprintf("  Totals: In %s  Out %s  Cache-R %s  Cache-W %s  Reqs %d  Avg %s\n",
 		statValueStyle.Render(formatNum(inputTok)),
 		statValueStyle.Render(formatNum(outputTok)),
 		statValueStyle.Render(formatNum(cacheRead)),
 		statValueStyle.Render(formatNum(cacheCreate)),
+		reqCount,
+		avgLatency,
 	))
-	b.WriteString(fmt.Sprintf(" Total: %s tok  TPM: %s  Reqs: %s  Avg latency: %s\n",
-		statValueStyle.Render(formatNum(totalTok)),
-		tpmStyle.Render(tpmStr),
-		statValueStyle.Render(fmt.Sprintf("%d", reqCount)),
-		statValueStyle.Render(avgLatency),
-	))
+
 	return borderStyle.Width(maxInt(m.width-2, 60)).Render(b.String())
+}
+
+// formatRateFloat renders a float rate, returning "--" if there's no data yet.
+func formatRateFloat(v float64, hasData bool) string {
+	if !hasData {
+		return "--"
+	}
+	return statValueStyle.Render(formatNum(int(v)))
+}
+
+// formatRateInt renders an integer rate, returning "--" if there's no data yet.
+func formatRateInt(v int, hasData bool) string {
+	if !hasData {
+		return "--"
+	}
+	return statValueStyle.Render(formatNum(v))
+}
+
+// formatPeakTime returns "(HH:MM:SS)" for a non-zero time, or "" otherwise.
+func formatPeakTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf("(%s)", t.Format("15:04:05"))
 }
 
 func (m Model) renderRequestLog(sess *store.Session, inflight map[uint64]store.InFlightReq) string {
@@ -247,20 +297,34 @@ func (m Model) renderAggregatePane() string {
 		}
 	}
 
-	tpm := m.store.CalculateAggregateTPM()
-	tpmStr := "--"
-	if tpm > 0 {
-		tpmStr = fmt.Sprintf("%.0f", tpm)
-	}
+	now := time.Now()
+	aItpm := m.store.RollingAggregateITPM(now)
+	aOtpm := m.store.RollingAggregateOTPM(now)
+	aRpm := m.store.RollingAggregateRPM(now)
+	peaks := m.store.GetAggregatePeaks()
+	hasData := totalReqs > 0
+
+	b.WriteString(fmt.Sprintf("  ITPM  |  current: %s     peak: %s  %s\n",
+		formatRateFloat(aItpm, hasData),
+		formatRateFloat(peaks.MaxITPM, peaks.MaxITPM > 0),
+		formatPeakTime(peaks.MaxITPMTime),
+	))
+	b.WriteString(fmt.Sprintf("  OTPM  |  current: %s     peak: %s  %s\n",
+		formatRateFloat(aOtpm, hasData),
+		formatRateFloat(peaks.MaxOTPM, peaks.MaxOTPM > 0),
+		formatPeakTime(peaks.MaxOTPMTime),
+	))
+	b.WriteString(fmt.Sprintf("  RPM   |  current: %s     peak: %s  %s\n",
+		formatRateInt(aRpm, hasData),
+		formatRateInt(peaks.MaxRPM, peaks.MaxRPM > 0),
+		formatPeakTime(peaks.MaxRPMTime),
+	))
 
 	uptime := time.Since(m.startTime).Truncate(time.Second)
-	b.WriteString(fmt.Sprintf(" Sessions: %s  Total: %s tok  TPM: %s\n",
+	b.WriteString(fmt.Sprintf("  Sessions: %s  Requests: %s  Total tok: %s  Uptime: %s\n",
 		statValueStyle.Render(fmt.Sprintf("%d", len(sessions))),
-		statValueStyle.Render(formatNum(totalTok)),
-		tpmStyle.Render(tpmStr),
-	))
-	b.WriteString(fmt.Sprintf(" Requests: %s  Uptime: %s\n",
 		statValueStyle.Render(fmt.Sprintf("%d", totalReqs)),
+		statValueStyle.Render(formatNum(totalTok)),
 		statValueStyle.Render(uptime.String()),
 	))
 
