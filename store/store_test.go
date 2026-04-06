@@ -5,6 +5,54 @@ import (
 	"time"
 )
 
+// Test helpers — unexported, package-local.
+type testRecordOpt func(*RequestRecord)
+
+func newTestRecord(opts ...testRecordOpt) RequestRecord {
+	base := time.Now()
+	rec := RequestRecord{
+		SessionID:  "test-session",
+		StartTime:  base.Add(-1 * time.Second),
+		EndTime:    base,
+		Model:      "claude-sonnet-4-20250514",
+		StatusCode: 200,
+		Endpoint:   "/v1/messages",
+	}
+	for _, opt := range opts {
+		opt(&rec)
+	}
+	return rec
+}
+
+func withSession(id string) testRecordOpt {
+	return func(r *RequestRecord) { r.SessionID = id }
+}
+
+func withEndTime(t time.Time) testRecordOpt {
+	return func(r *RequestRecord) {
+		r.EndTime = t
+		if r.StartTime.After(t) || r.StartTime.Equal(t) {
+			r.StartTime = t.Add(-1 * time.Second)
+		}
+	}
+}
+
+func withStartEnd(start, end time.Time) testRecordOpt {
+	return func(r *RequestRecord) {
+		r.StartTime = start
+		r.EndTime = end
+	}
+}
+
+func withTokens(input, output, cacheCreate, cacheRead int) testRecordOpt {
+	return func(r *RequestRecord) {
+		r.InputTokens = input
+		r.OutputTokens = output
+		r.CacheCreation = cacheCreate
+		r.CacheRead = cacheRead
+	}
+}
+
 func TestNewStore(t *testing.T) {
 	s := NewStore()
 	if s == nil {
@@ -144,71 +192,440 @@ func TestMergeIntervalsEmpty(t *testing.T) {
 	}
 }
 
-func TestCalculateTPM(t *testing.T) {
-	s := NewStore()
-	now := time.Now()
+func TestRequestRecordNullableHeaderFields(t *testing.T) {
+	iLimit := 450000
+	iRemaining := 448500
+	fiveHUtil := 0.0184
+	fiveHReset := int64(1712345678)
 
-	// 2 sequential requests, each 30s, 5000 tokens each = 10000 tokens in 60s = 10000 TPM
-	s.AddRecord(RequestRecord{
-		StartTime: now.Add(-60 * time.Second), EndTime: now.Add(-30 * time.Second),
-		InputTokens: 3000, OutputTokens: 2000, SessionID: "s1", StatusCode: 200,
-	})
-	s.AddRecord(RequestRecord{
-		StartTime: now.Add(-30 * time.Second), EndTime: now,
-		InputTokens: 3000, OutputTokens: 2000, SessionID: "s1", StatusCode: 200,
-	})
-
-	tpm := s.CalculateTPM("s1")
-	if tpm < 9900 || tpm > 10100 {
-		t.Fatalf("expected ~10000 TPM, got %.0f", tpm)
+	rec := RequestRecord{
+		SessionID:         "s1",
+		ITokensLimit:      &iLimit,
+		ITokensRemaining:  &iRemaining,
+		ITokensReset:      "2026-04-05T14:30:00Z",
+		Unified5hUtil:     &fiveHUtil,
+		Unified5hReset:    &fiveHReset,
+		UnifiedStatus:     "allowed",
+		UnifiedReprClaim:  "five_hour",
+	}
+	if rec.ITokensLimit == nil || *rec.ITokensLimit != 450000 {
+		t.Fatalf("ITokensLimit not set correctly")
+	}
+	if rec.Unified5hUtil == nil || *rec.Unified5hUtil != 0.0184 {
+		t.Fatalf("Unified5hUtil not set correctly")
+	}
+	if rec.UnifiedStatus != "allowed" {
+		t.Fatalf("UnifiedStatus not set correctly")
 	}
 }
 
-func TestCalculateTPMConcurrent(t *testing.T) {
-	s := NewStore()
-	now := time.Now()
-
-	// 2 concurrent requests, same 30s window, 5000 tokens each = 10000 tokens in 30s = 20000 TPM
-	s.AddRecord(RequestRecord{
-		StartTime: now.Add(-30 * time.Second), EndTime: now,
-		InputTokens: 3000, OutputTokens: 2000, SessionID: "s1", StatusCode: 200,
-	})
-	s.AddRecord(RequestRecord{
-		StartTime: now.Add(-30 * time.Second), EndTime: now,
-		InputTokens: 3000, OutputTokens: 2000, SessionID: "s1", StatusCode: 200,
-	})
-
-	tpm := s.CalculateTPM("s1")
-	if tpm < 19900 || tpm > 20100 {
-		t.Fatalf("expected ~20000 TPM, got %.0f", tpm)
+func TestNewTestRecordDefaults(t *testing.T) {
+	rec := newTestRecord()
+	if rec.SessionID != "test-session" {
+		t.Fatalf("expected default session 'test-session', got %q", rec.SessionID)
+	}
+	if rec.StatusCode != 200 {
+		t.Fatalf("expected default status 200, got %d", rec.StatusCode)
+	}
+	if rec.StartTime.IsZero() || rec.EndTime.IsZero() {
+		t.Fatal("expected default timestamps to be set")
+	}
+	if !rec.EndTime.After(rec.StartTime) {
+		t.Fatal("expected EndTime to be after StartTime")
 	}
 }
 
-func TestCalculateTPMZeroActiveTime(t *testing.T) {
-	s := NewStore()
-	tpm := s.CalculateTPM("nonexistent")
-	if tpm != 0 {
-		t.Fatalf("expected 0 TPM for nonexistent session, got %.0f", tpm)
+func TestNewTestRecordOverrides(t *testing.T) {
+	at := time.Date(2026, 4, 5, 14, 0, 0, 0, time.UTC)
+	rec := newTestRecord(
+		withSession("alt"),
+		withEndTime(at),
+		withTokens(1000, 200, 50, 300),
+	)
+	if rec.SessionID != "alt" {
+		t.Fatalf("expected 'alt', got %q", rec.SessionID)
+	}
+	if !rec.EndTime.Equal(at) {
+		t.Fatalf("expected EndTime %v, got %v", at, rec.EndTime)
+	}
+	if rec.InputTokens != 1000 || rec.OutputTokens != 200 || rec.CacheCreation != 50 || rec.CacheRead != 300 {
+		t.Fatalf("token overrides not applied: %+v", rec)
 	}
 }
 
-func TestCalculateAggregateTPM(t *testing.T) {
+func TestRollingITPM_WindowBoundary(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
 
-	s.AddRecord(RequestRecord{
-		StartTime: now.Add(-60 * time.Second), EndTime: now.Add(-30 * time.Second),
-		InputTokens: 5000, OutputTokens: 0, SessionID: "s1", StatusCode: 200,
-	})
-	s.AddRecord(RequestRecord{
-		StartTime: now.Add(-30 * time.Second), EndTime: now,
-		InputTokens: 5000, OutputTokens: 0, SessionID: "s2", StatusCode: 200,
-	})
+	// Record that ended 59s ago — should count
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-59*time.Second)),
+		withTokens(1000, 0, 0, 0),
+	))
+	// Record that ended 61s ago — should NOT count
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-61*time.Second)),
+		withTokens(9999, 0, 0, 0),
+	))
 
-	tpm := s.CalculateAggregateTPM()
-	// 10000 tokens, 60s active = 10000 TPM
-	if tpm < 9900 || tpm > 10100 {
-		t.Fatalf("expected ~10000 TPM, got %.0f", tpm)
+	got := s.RollingITPM("s1", now)
+	if got != 1000 {
+		t.Fatalf("expected ITPM=1000, got %v", got)
+	}
+}
+
+func TestRollingITPM_IncludesCacheCreationExcludesCacheRead(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(500, 9999, 200, 100000), // input=500, output=9999 (ignored for ITPM), cache_creation=200, cache_read=100000 (excluded)
+	))
+
+	got := s.RollingITPM("s1", now)
+	if got != 700 { // 500 + 200
+		t.Fatalf("expected ITPM=700 (input+cache_creation), got %v", got)
+	}
+}
+
+func TestRollingITPM_EmptySession(t *testing.T) {
+	s := NewStore()
+	got := s.RollingITPM("nonexistent", time.Now())
+	if got != 0 {
+		t.Fatalf("expected 0 for nonexistent session, got %v", got)
+	}
+}
+
+func TestRollingITPM_AllRecordsOutsideWindow(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Minute)),
+		withTokens(5000, 1000, 0, 0),
+	))
+	got := s.RollingITPM("s1", now)
+	if got != 0 {
+		t.Fatalf("expected 0 for all-outside-window, got %v", got)
+	}
+}
+
+func TestRollingITPM_InFlightExcluded(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(100, 0, 0, 0),
+	))
+	s.AddInFlight("s1", "/v1/messages")
+	got := s.RollingITPM("s1", now)
+	if got != 100 {
+		t.Fatalf("expected 100 (completed record counts, in-flight does not), got %v", got)
+	}
+}
+
+func TestRollingOTPM_OutputOnly(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(9999, 250, 9999, 9999), // only output (250) should count
+	))
+
+	got := s.RollingOTPM("s1", now)
+	if got != 250 {
+		t.Fatalf("expected OTPM=250 (output only), got %v", got)
+	}
+}
+
+func TestRollingOTPM_WindowBoundary(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-59*time.Second)),
+		withTokens(0, 100, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-61*time.Second)),
+		withTokens(0, 9999, 0, 0),
+	))
+	got := s.RollingOTPM("s1", now)
+	if got != 100 {
+		t.Fatalf("expected OTPM=100, got %v", got)
+	}
+}
+
+func TestRollingRPM_CountsRequests(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(1000, 200, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-20*time.Second)),
+		withTokens(0, 0, 0, 0), // zero-token error response still counts
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-70*time.Second)), // outside window
+		withTokens(1000, 200, 0, 0),
+	))
+
+	got := s.RollingRPM("s1", now)
+	if got != 2 {
+		t.Fatalf("expected RPM=2, got %d", got)
+	}
+}
+
+func TestRollingRPM_EmptySession(t *testing.T) {
+	s := NewStore()
+	if s.RollingRPM("nope", time.Now()) != 0 {
+		t.Fatal("expected 0 for empty session")
+	}
+}
+
+func TestRollingAggregateITPM_SumsAllSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(1000, 200, 50, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-20*time.Second)),
+		withTokens(500, 100, 25, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s3"),
+		withEndTime(now.Add(-70*time.Second)), // outside window
+		withTokens(9999, 9999, 9999, 0),
+	))
+
+	got := s.RollingAggregateITPM(now)
+	want := float64(1000 + 50 + 500 + 25) // 1575
+	if got != want {
+		t.Fatalf("expected aggregate ITPM=%v, got %v", want, got)
+	}
+}
+
+func TestRollingAggregateOTPM(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(0, 300, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(0, 150, 0, 0),
+	))
+	got := s.RollingAggregateOTPM(now)
+	if got != 450 {
+		t.Fatalf("expected aggregate OTPM=450, got %v", got)
+	}
+}
+
+func TestRollingAggregateRPM(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		s.AddRecord(newTestRecord(
+			withSession("s1"),
+			withEndTime(now.Add(time.Duration(-i*5)*time.Second)),
+		))
+	}
+	for i := 0; i < 2; i++ {
+		s.AddRecord(newTestRecord(
+			withSession("s2"),
+			withEndTime(now.Add(time.Duration(-i*5)*time.Second)),
+		))
+	}
+	got := s.RollingAggregateRPM(now)
+	if got != 5 {
+		t.Fatalf("expected aggregate RPM=5, got %d", got)
+	}
+}
+
+func TestSessionPeaks_UpdateOnIncrease(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(withSession("s1"), withEndTime(now)))
+
+	s.UpdateSessionPeaks("s1", 100, 20, 3, now)
+	peaks := s.GetSessionPeaks("s1")
+	if peaks.MaxITPM != 100 || peaks.MaxOTPM != 20 || peaks.MaxRPM != 3 {
+		t.Fatalf("expected (100,20,3), got (%v,%v,%d)", peaks.MaxITPM, peaks.MaxOTPM, peaks.MaxRPM)
+	}
+
+	later := now.Add(time.Second)
+	s.UpdateSessionPeaks("s1", 250, 10, 2, later)
+	peaks = s.GetSessionPeaks("s1")
+	if peaks.MaxITPM != 250 {
+		t.Fatalf("expected MaxITPM=250, got %v", peaks.MaxITPM)
+	}
+	if !peaks.MaxITPMTime.Equal(later) {
+		t.Fatalf("expected MaxITPMTime=%v, got %v", later, peaks.MaxITPMTime)
+	}
+	if peaks.MaxOTPM != 20 {
+		t.Fatalf("expected MaxOTPM=20 (unchanged), got %v", peaks.MaxOTPM)
+	}
+}
+
+func TestSessionPeaks_PersistAcrossQuiet(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(withSession("s1"), withEndTime(now)))
+
+	s.UpdateSessionPeaks("s1", 500, 100, 10, now)
+	s.UpdateSessionPeaks("s1", 0, 0, 0, now.Add(10*time.Second))
+
+	peaks := s.GetSessionPeaks("s1")
+	if peaks.MaxITPM != 500 || peaks.MaxOTPM != 100 || peaks.MaxRPM != 10 {
+		t.Fatalf("peaks should persist after quiet period, got %+v", peaks)
+	}
+}
+
+func TestSessionPeaks_NonexistentSession(t *testing.T) {
+	s := NewStore()
+	peaks := s.GetSessionPeaks("nope")
+	if peaks.MaxITPM != 0 || peaks.MaxOTPM != 0 || peaks.MaxRPM != 0 {
+		t.Fatalf("expected zero peaks for nonexistent session, got %+v", peaks)
+	}
+}
+
+func TestAggregatePeaks_TrackAcrossSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	peaks := s.GetAggregatePeaks()
+	if peaks.MaxITPM != 0 || peaks.MaxOTPM != 0 || peaks.MaxRPM != 0 {
+		t.Fatalf("expected zero peaks initially, got %+v", peaks)
+	}
+
+	s.UpdateAggregatePeaks(1000, 200, 15, now)
+	peaks = s.GetAggregatePeaks()
+	if peaks.MaxITPM != 1000 || peaks.MaxOTPM != 200 || peaks.MaxRPM != 15 {
+		t.Fatalf("expected (1000,200,15), got %+v", peaks)
+	}
+
+	s.UpdateAggregatePeaks(500, 50, 5, now.Add(time.Second))
+	peaks = s.GetAggregatePeaks()
+	if peaks.MaxITPM != 1000 {
+		t.Fatalf("expected MaxITPM=1000 unchanged, got %v", peaks.MaxITPM)
+	}
+}
+
+func TestAggregatePeaks_MultipleSessions(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	s.AddRecord(newTestRecord(
+		withSession("s1"),
+		withEndTime(now.Add(-5*time.Second)),
+		withTokens(400, 80, 0, 0),
+	))
+	s.AddRecord(newTestRecord(
+		withSession("s2"),
+		withEndTime(now.Add(-10*time.Second)),
+		withTokens(300, 60, 0, 0),
+	))
+
+	aItpm := s.RollingAggregateITPM(now)
+	aOtpm := s.RollingAggregateOTPM(now)
+	aRpm := s.RollingAggregateRPM(now)
+	s.UpdateAggregatePeaks(aItpm, aOtpm, aRpm, now)
+
+	peaks := s.GetAggregatePeaks()
+	if peaks.MaxITPM != 700 {
+		t.Errorf("expected aggregate MaxITPM=700 (sum across sessions), got %v", peaks.MaxITPM)
+	}
+	if peaks.MaxOTPM != 140 {
+		t.Errorf("expected aggregate MaxOTPM=140, got %v", peaks.MaxOTPM)
+	}
+	if peaks.MaxRPM != 2 {
+		t.Errorf("expected aggregate MaxRPM=2, got %d", peaks.MaxRPM)
+	}
+}
+
+func TestRollingMetrics_ConcurrentReaders(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+
+	for i := 0; i < 100; i++ {
+		s.AddRecord(newTestRecord(
+			withSession("s1"),
+			withEndTime(now.Add(-time.Duration(i)*time.Second)),
+			withTokens(100, 50, 10, 0),
+		))
+	}
+
+	done := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		go func() {
+			for j := 0; j < 1000; j++ {
+				_ = s.RollingITPM("s1", time.Now())
+				_ = s.RollingOTPM("s1", time.Now())
+				_ = s.RollingRPM("s1", time.Now())
+				_ = s.RollingAggregateITPM(time.Now())
+				_ = s.GetSessionPeaks("s1")
+			}
+			done <- struct{}{}
+		}()
+	}
+	go func() {
+		for j := 0; j < 500; j++ {
+			s.AddRecord(newTestRecord(withSession("s1"), withEndTime(time.Now())))
+			s.UpdateSessionPeaks("s1", float64(j), float64(j), j, time.Now())
+		}
+		done <- struct{}{}
+	}()
+
+	for i := 0; i < 9; i++ {
+		<-done
+	}
+}
+
+func TestAddRecord_DeepCopiesPointerFields(t *testing.T) {
+	s := NewStore()
+
+	iLimit := 450000
+	rec := RequestRecord{
+		SessionID:    "s1",
+		StartTime:    time.Now().Add(-1 * time.Second),
+		EndTime:      time.Now(),
+		StatusCode:   200,
+		ITokensLimit: &iLimit,
+	}
+	s.AddRecord(rec)
+
+	// Mutate the original pointer value
+	iLimit = 999999
+
+	// The store's copy should NOT be affected
+	sess := s.GetSession("s1")
+	if sess == nil || len(sess.Requests) != 1 {
+		t.Fatal("expected 1 request in session")
+	}
+	if sess.Requests[0].ITokensLimit == nil || *sess.Requests[0].ITokensLimit != 450000 {
+		t.Fatalf("expected store copy to be 450000 (not mutated), got %v", *sess.Requests[0].ITokensLimit)
 	}
 }
 

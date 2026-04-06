@@ -4,6 +4,7 @@ import (
 	"claude-proxy/store"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -70,22 +71,141 @@ func (d *DB) createSchema() error {
 		CREATE INDEX IF NOT EXISTS idx_requests_start_time ON requests(start_time);
 		CREATE INDEX IF NOT EXISTS idx_requests_status_code_time ON requests(status_code, start_time);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Additive migration for the ITPM/OTPM/RPM design. Each ALTER TABLE is idempotent
+	// via duplicate-column error tolerance so repeated startup is safe.
+	// end_time_epoch is required because modernc.org/sqlite stores time.Time values
+	// in a format SQLite's strftime() cannot parse. See spec for details.
+	alters := []string{
+		`ALTER TABLE requests ADD COLUMN end_time_epoch      INTEGER`,
+		`ALTER TABLE requests ADD COLUMN itokens_limit       INTEGER`,
+		`ALTER TABLE requests ADD COLUMN itokens_remaining   INTEGER`,
+		`ALTER TABLE requests ADD COLUMN itokens_reset       TEXT`,
+		`ALTER TABLE requests ADD COLUMN otokens_limit       INTEGER`,
+		`ALTER TABLE requests ADD COLUMN otokens_remaining   INTEGER`,
+		`ALTER TABLE requests ADD COLUMN otokens_reset       TEXT`,
+		`ALTER TABLE requests ADD COLUMN rpm_limit           INTEGER`,
+		`ALTER TABLE requests ADD COLUMN rpm_remaining       INTEGER`,
+		`ALTER TABLE requests ADD COLUMN rpm_reset           TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_5h_util     REAL`,
+		`ALTER TABLE requests ADD COLUMN unified_5h_reset    INTEGER`,
+		`ALTER TABLE requests ADD COLUMN unified_5h_status   TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_7d_util     REAL`,
+		`ALTER TABLE requests ADD COLUMN unified_7d_reset    INTEGER`,
+		`ALTER TABLE requests ADD COLUMN unified_7d_status   TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_status      TEXT`,
+		`ALTER TABLE requests ADD COLUMN unified_repr_claim  TEXT`,
+	}
+	for _, stmt := range alters {
+		if _, err := d.conn.Exec(stmt); err != nil {
+			// SQLite returns "duplicate column name: X" if the column exists. Ignore that.
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return fmt.Errorf("migration failed (%s): %w", stmt, err)
+			}
+		}
+	}
+	// Index on end_time_epoch for TPM bucket queries.
+	if _, err := d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_end_time_epoch ON requests(end_time_epoch)`); err != nil {
+		return fmt.Errorf("create idx_requests_end_time_epoch: %w", err)
+	}
+
+	// Backfill end_time_epoch for rows inserted before this migration.
+	// We parse end_time in Go (not SQL) because modernc.org/sqlite stores
+	// time.Time in a format SQLite's strftime cannot parse.
+	rows, err := d.conn.Query(`SELECT id, end_time FROM requests WHERE end_time_epoch IS NULL`)
+	if err != nil {
+		return fmt.Errorf("backfill query: %w", err)
+	}
+	var updates []struct {
+		id    int64
+		epoch int64
+	}
+	for rows.Next() {
+		var id int64
+		var endTimeStr string
+		if err := rows.Scan(&id, &endTimeStr); err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill scan: %w", err)
+		}
+		t := parseTime(endTimeStr)
+		if !t.IsZero() {
+			updates = append(updates, struct {
+				id    int64
+				epoch int64
+			}{id, t.Unix()})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("backfill iterate: %w", err)
+	}
+	for _, u := range updates {
+		if _, err := d.conn.Exec(`UPDATE requests SET end_time_epoch = ? WHERE id = ?`, u.epoch, u.id); err != nil {
+			return fmt.Errorf("backfill update id=%d: %w", u.id, err)
+		}
+	}
+
+	return nil
 }
 
 func (d *DB) InsertRecord(rec store.RequestRecord) error {
 	_, err := d.conn.Exec(`
 		INSERT INTO requests (
-			session_id, start_time, end_time, model, endpoint, status_code,
+			session_id, start_time, end_time, end_time_epoch, model, endpoint, status_code,
 			input_tokens, output_tokens, cache_creation, cache_read,
-			ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.SessionID, rec.StartTime.UTC(), rec.EndTime.UTC(), rec.Model, rec.Endpoint, rec.StatusCode,
+			ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
+			itokens_limit, itokens_remaining, itokens_reset,
+			otokens_limit, otokens_remaining, otokens_reset,
+			rpm_limit, rpm_remaining, rpm_reset,
+			unified_5h_util, unified_5h_reset, unified_5h_status,
+			unified_7d_util, unified_7d_reset, unified_7d_status,
+			unified_status, unified_repr_claim
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.SessionID, rec.StartTime.UTC(), rec.EndTime.UTC(), rec.EndTime.UTC().Unix(),
+		rec.Model, rec.Endpoint, rec.StatusCode,
 		rec.InputTokens, rec.OutputTokens, rec.CacheCreation, rec.CacheRead,
 		rec.TTFT.Milliseconds(), rec.RetryAfter, rec.RateLimitReqRemaining, rec.RateLimitTokRemaining,
 		boolToInt(rec.HasError),
+		intPtrToNullInt(rec.ITokensLimit), intPtrToNullInt(rec.ITokensRemaining), stringToNullString(rec.ITokensReset),
+		intPtrToNullInt(rec.OTokensLimit), intPtrToNullInt(rec.OTokensRemaining), stringToNullString(rec.OTokensReset),
+		intPtrToNullInt(rec.RPMLimit), intPtrToNullInt(rec.RPMRemaining), stringToNullString(rec.RPMReset),
+		floatPtrToNullFloat(rec.Unified5hUtil), int64PtrToNullInt(rec.Unified5hReset), stringToNullString(rec.Unified5hStatus),
+		floatPtrToNullFloat(rec.Unified7dUtil), int64PtrToNullInt(rec.Unified7dReset), stringToNullString(rec.Unified7dStatus),
+		stringToNullString(rec.UnifiedStatus), stringToNullString(rec.UnifiedReprClaim),
 	)
 	return err
+}
+
+func intPtrToNullInt(p *int) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*p), Valid: true}
+}
+
+func int64PtrToNullInt(p *int64) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *p, Valid: true}
+}
+
+func floatPtrToNullFloat(p *float64) sql.NullFloat64 {
+	if p == nil {
+		return sql.NullFloat64{}
+	}
+	return sql.NullFloat64{Float64: *p, Valid: true}
+}
+
+func stringToNullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 func boolToInt(b bool) int {
@@ -96,7 +216,16 @@ func boolToInt(b bool) int {
 }
 
 func (d *DB) QueryRequests(from, to, sessionID string, limit int) ([]store.RequestRecord, error) {
-	q := "SELECT session_id, start_time, end_time, model, endpoint, status_code, input_tokens, output_tokens, cache_creation, cache_read, ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error FROM requests WHERE 1=1"
+	q := `SELECT session_id, start_time, end_time, model, endpoint, status_code,
+		input_tokens, output_tokens, cache_creation, cache_read,
+		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
+		itokens_limit, itokens_remaining, itokens_reset,
+		otokens_limit, otokens_remaining, otokens_reset,
+		rpm_limit, rpm_remaining, rpm_reset,
+		unified_5h_util, unified_5h_reset, unified_5h_status,
+		unified_7d_util, unified_7d_reset, unified_7d_status,
+		unified_status, unified_repr_claim
+		FROM requests WHERE 1=1`
 	var args []any
 	if from != "" {
 		q += " AND start_time >= ?"
@@ -161,7 +290,13 @@ func (d *DB) QuerySessions(limit int) ([]SessionSummary, error) {
 func (d *DB) QueryThrottle(ttftThresholdMs int, from, to, sessionID string, limit int) ([]store.RequestRecord, error) {
 	q := `SELECT session_id, start_time, end_time, model, endpoint, status_code,
 		input_tokens, output_tokens, cache_creation, cache_read,
-		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error
+		ttft_ms, retry_after, ratelimit_req_remaining, ratelimit_tok_remaining, has_error,
+		itokens_limit, itokens_remaining, itokens_reset,
+		otokens_limit, otokens_remaining, otokens_reset,
+		rpm_limit, rpm_remaining, rpm_reset,
+		unified_5h_util, unified_5h_reset, unified_5h_status,
+		unified_7d_util, unified_7d_reset, unified_7d_status,
+		unified_status, unified_repr_claim
 		FROM requests WHERE (status_code IN (429, 529) OR has_error = 1 OR ttft_ms > ?)`
 	args := []any{ttftThresholdMs}
 	if from != "" {
@@ -251,10 +386,22 @@ func scanRecords(rows *sql.Rows) ([]store.RequestRecord, error) {
 		var ttftMs int64
 		var hasErr int
 		var startTime, endTime string
+		var iLimit, iRemaining, oLimit, oRemaining, rLimit, rRemaining sql.NullInt64
+		var iReset, oReset, rReset sql.NullString
+		var u5hUtil, u7dUtil sql.NullFloat64
+		var u5hReset, u7dReset sql.NullInt64
+		var u5hStatus, u7dStatus, uStatus, uReprClaim sql.NullString
+
 		if err := rows.Scan(
 			&r.SessionID, &startTime, &endTime, &r.Model, &r.Endpoint, &r.StatusCode,
 			&r.InputTokens, &r.OutputTokens, &r.CacheCreation, &r.CacheRead,
 			&ttftMs, &r.RetryAfter, &r.RateLimitReqRemaining, &r.RateLimitTokRemaining, &hasErr,
+			&iLimit, &iRemaining, &iReset,
+			&oLimit, &oRemaining, &oReset,
+			&rLimit, &rRemaining, &rReset,
+			&u5hUtil, &u5hReset, &u5hStatus,
+			&u7dUtil, &u7dReset, &u7dStatus,
+			&uStatus, &uReprClaim,
 		); err != nil {
 			return nil, err
 		}
@@ -262,7 +409,250 @@ func scanRecords(rows *sql.Rows) ([]store.RequestRecord, error) {
 		r.EndTime = parseTime(endTime)
 		r.TTFT = time.Duration(ttftMs) * time.Millisecond
 		r.HasError = hasErr != 0
+
+		r.ITokensLimit = nullIntToIntPtr(iLimit)
+		r.ITokensRemaining = nullIntToIntPtr(iRemaining)
+		r.ITokensReset = iReset.String
+		r.OTokensLimit = nullIntToIntPtr(oLimit)
+		r.OTokensRemaining = nullIntToIntPtr(oRemaining)
+		r.OTokensReset = oReset.String
+		r.RPMLimit = nullIntToIntPtr(rLimit)
+		r.RPMRemaining = nullIntToIntPtr(rRemaining)
+		r.RPMReset = rReset.String
+		r.Unified5hUtil = nullFloatToFloatPtr(u5hUtil)
+		r.Unified5hReset = nullIntToInt64Ptr(u5hReset)
+		r.Unified5hStatus = u5hStatus.String
+		r.Unified7dUtil = nullFloatToFloatPtr(u7dUtil)
+		r.Unified7dReset = nullIntToInt64Ptr(u7dReset)
+		r.Unified7dStatus = u7dStatus.String
+		r.UnifiedStatus = uStatus.String
+		r.UnifiedReprClaim = uReprClaim.String
+
 		records = append(records, r)
 	}
 	return records, rows.Err()
+}
+
+func nullIntToIntPtr(n sql.NullInt64) *int {
+	if !n.Valid {
+		return nil
+	}
+	v := int(n.Int64)
+	return &v
+}
+
+func nullIntToInt64Ptr(n sql.NullInt64) *int64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Int64
+	return &v
+}
+
+func nullFloatToFloatPtr(n sql.NullFloat64) *float64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Float64
+	return &v
+}
+
+// TPMBucket is one row of the bucketed TPM query result.
+type TPMBucket struct {
+	BucketStart   time.Time // start of the bucket in UTC
+	MaxITPM       float64
+	MaxOTPM       float64
+	MaxRPM        int
+	SampleMinutes int // count of minute windows with data in this bucket
+}
+
+// TPMPeak is one row of the peak TPM query result.
+// For all-time peak (no group-by), SessionID is empty and one row is returned.
+// For group-by session, one row per session_id is returned.
+type TPMPeak struct {
+	SessionID string
+	MaxITPM   float64
+	MaxOTPM   float64
+	MaxRPM    int
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// QueryTPMBuckets returns bucketed max-per-bucket ITPM/OTPM/RPM over the time range.
+// The inner aggregation groups by minute-of-end; the outer query groups those minutes
+// into the requested bucket size and picks the peak per bucket.
+func (d *DB) QueryTPMBuckets(from, to time.Time, bucketSeconds int, sessionID string) ([]TPMBucket, error) {
+	if bucketSeconds <= 0 {
+		bucketSeconds = 60
+	}
+	// end_time_epoch is an integer unix timestamp populated at insert time. We use it
+	// directly instead of strftime('%s', end_time) because modernc.org/sqlite stores
+	// time.Time values in a format SQLite's date functions cannot parse.
+	sessionFilter := ""
+	args := []any{from.UTC().Unix(), to.UTC().Unix()}
+	if sessionID != "" {
+		sessionFilter = "AND session_id = ?"
+		args = append(args, sessionID)
+	}
+	q := fmt.Sprintf(`
+		WITH minute_windows AS (
+			SELECT
+				(end_time_epoch / 60) * 60        AS minute_epoch,
+				SUM(input_tokens + cache_creation) AS itpm,
+				SUM(output_tokens)                 AS otpm,
+				COUNT(*)                           AS rpm
+			FROM requests
+			WHERE end_time_epoch BETWEEN ? AND ?
+			  AND end_time_epoch IS NOT NULL
+			  %s
+			GROUP BY minute_epoch
+		)
+		SELECT
+			(minute_epoch / ?) * ? AS bucket_epoch,
+			MAX(itpm)              AS max_itpm,
+			MAX(otpm)              AS max_otpm,
+			MAX(rpm)               AS max_rpm,
+			COUNT(*)               AS sample_minutes
+		FROM minute_windows
+		GROUP BY bucket_epoch
+		ORDER BY bucket_epoch ASC`, sessionFilter)
+	args = append(args, bucketSeconds, bucketSeconds)
+	rows, err := d.conn.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TPMBucket
+	for rows.Next() {
+		var bucketEpoch int64
+		var maxITPM, maxOTPM sql.NullFloat64
+		var maxRPM sql.NullInt64
+		var samples int
+		if err := rows.Scan(&bucketEpoch, &maxITPM, &maxOTPM, &maxRPM, &samples); err != nil {
+			return nil, err
+		}
+		b := TPMBucket{
+			BucketStart:   time.Unix(bucketEpoch, 0).UTC(),
+			SampleMinutes: samples,
+		}
+		if maxITPM.Valid {
+			b.MaxITPM = maxITPM.Float64
+		}
+		if maxOTPM.Valid {
+			b.MaxOTPM = maxOTPM.Float64
+		}
+		if maxRPM.Valid {
+			b.MaxRPM = int(maxRPM.Int64)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// QueryTPMPeak returns peak ITPM/OTPM/RPM over the time range. With groupBy="session",
+// returns one row per session. Otherwise returns a single row for the all-time peak.
+func (d *DB) QueryTPMPeak(from, to time.Time, groupBy string, sessionID string) ([]TPMPeak, error) {
+	if groupBy != "" && groupBy != "session" {
+		return nil, fmt.Errorf("unknown group-by: %q (valid: \"\", \"session\")", groupBy)
+	}
+
+	// Uses end_time_epoch (integer unix seconds) for the same reasons as QueryTPMBuckets.
+	sessionFilter := ""
+	args := []any{from.UTC().Unix(), to.UTC().Unix()}
+	if sessionID != "" {
+		sessionFilter = "AND session_id = ?"
+		args = append(args, sessionID)
+	}
+
+	var q string
+	if groupBy == "session" {
+		q = fmt.Sprintf(`
+			WITH minute_windows AS (
+				SELECT
+					session_id,
+					(end_time_epoch / 60) * 60        AS minute_epoch,
+					SUM(input_tokens + cache_creation) AS itpm,
+					SUM(output_tokens)                 AS otpm,
+					COUNT(*)                           AS rpm
+				FROM requests
+				WHERE end_time_epoch BETWEEN ? AND ?
+				  AND end_time_epoch IS NOT NULL
+				  %s
+				GROUP BY session_id, minute_epoch
+			)
+			SELECT
+				session_id,
+				MAX(itpm),
+				MAX(otpm),
+				MAX(rpm),
+				MIN(minute_epoch),
+				MAX(minute_epoch)
+			FROM minute_windows
+			GROUP BY session_id
+			ORDER BY MAX(itpm) DESC`, sessionFilter)
+	} else {
+		q = fmt.Sprintf(`
+			WITH minute_windows AS (
+				SELECT
+					(end_time_epoch / 60) * 60        AS minute_epoch,
+					SUM(input_tokens + cache_creation) AS itpm,
+					SUM(output_tokens)                 AS otpm,
+					COUNT(*)                           AS rpm
+				FROM requests
+				WHERE end_time_epoch BETWEEN ? AND ?
+				  AND end_time_epoch IS NOT NULL
+				  %s
+				GROUP BY minute_epoch
+			)
+			SELECT
+				'',
+				MAX(itpm),
+				MAX(otpm),
+				MAX(rpm),
+				MIN(minute_epoch),
+				MAX(minute_epoch)
+			FROM minute_windows`, sessionFilter)
+	}
+
+	rows, err := d.conn.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TPMPeak
+	for rows.Next() {
+		var sessID sql.NullString
+		var maxITPM, maxOTPM sql.NullFloat64
+		var maxRPM sql.NullInt64
+		var minEpoch, maxEpoch sql.NullInt64
+		if err := rows.Scan(&sessID, &maxITPM, &maxOTPM, &maxRPM, &minEpoch, &maxEpoch); err != nil {
+			return nil, err
+		}
+		// Skip the all-zero row that the "no data" all-time query produces.
+		if !maxITPM.Valid && !maxOTPM.Valid && !maxRPM.Valid {
+			continue
+		}
+		p := TPMPeak{
+			SessionID: sessID.String,
+		}
+		if maxITPM.Valid {
+			p.MaxITPM = maxITPM.Float64
+		}
+		if maxOTPM.Valid {
+			p.MaxOTPM = maxOTPM.Float64
+		}
+		if maxRPM.Valid {
+			p.MaxRPM = int(maxRPM.Int64)
+		}
+		if minEpoch.Valid {
+			p.FirstSeen = time.Unix(minEpoch.Int64, 0).UTC()
+		}
+		if maxEpoch.Valid {
+			p.LastSeen = time.Unix(maxEpoch.Int64, 0).UTC()
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }

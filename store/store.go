@@ -23,6 +23,38 @@ type RequestRecord struct {
 	RateLimitTokRemaining int
 	HasError              bool
 	SessionID             string
+
+	// Per-direction API-key rate-limit headers (anthropic-ratelimit-{input,output}-tokens-*)
+	ITokensLimit     *int
+	ITokensRemaining *int
+	ITokensReset     string // RFC3339 as emitted by API
+	OTokensLimit     *int
+	OTokensRemaining *int
+	OTokensReset     string
+
+	// Per-key request-rate headers (anthropic-ratelimit-requests-*)
+	RPMLimit     *int
+	RPMRemaining *int
+	RPMReset     string
+
+	// Unified OAuth rate-limit headers (anthropic-ratelimit-unified-*)
+	Unified5hUtil    *float64
+	Unified5hReset   *int64 // unix seconds
+	Unified5hStatus  string
+	Unified7dUtil    *float64
+	Unified7dReset   *int64 // unix seconds
+	Unified7dStatus  string
+	UnifiedStatus    string // "allowed" | "rate_limited"
+	UnifiedReprClaim string // e.g., "five_hour"
+}
+
+type SessionPeaks struct {
+	MaxITPM     float64
+	MaxITPMTime time.Time
+	MaxOTPM     float64
+	MaxOTPMTime time.Time
+	MaxRPM      int
+	MaxRPMTime  time.Time
 }
 
 type Session struct {
@@ -30,6 +62,7 @@ type Session struct {
 	StartTime time.Time
 	LastSeen  time.Time
 	Requests  []RequestRecord
+	Peaks     SessionPeaks
 }
 
 type InFlightReq struct {
@@ -39,10 +72,11 @@ type InFlightReq struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	inflight map[uint64]InFlightReq
-	nextID   atomic.Uint64
+	mu             sync.RWMutex
+	sessions       map[string]*Session
+	inflight       map[uint64]InFlightReq
+	nextID         atomic.Uint64
+	aggregatePeaks SessionPeaks
 }
 
 func NewStore() *Store {
@@ -50,6 +84,50 @@ func NewStore() *Store {
 		sessions: make(map[string]*Session),
 		inflight: make(map[uint64]InFlightReq),
 	}
+}
+
+func deepCopyRecord(r RequestRecord) RequestRecord {
+	if r.ITokensLimit != nil {
+		v := *r.ITokensLimit
+		r.ITokensLimit = &v
+	}
+	if r.ITokensRemaining != nil {
+		v := *r.ITokensRemaining
+		r.ITokensRemaining = &v
+	}
+	if r.OTokensLimit != nil {
+		v := *r.OTokensLimit
+		r.OTokensLimit = &v
+	}
+	if r.OTokensRemaining != nil {
+		v := *r.OTokensRemaining
+		r.OTokensRemaining = &v
+	}
+	if r.RPMLimit != nil {
+		v := *r.RPMLimit
+		r.RPMLimit = &v
+	}
+	if r.RPMRemaining != nil {
+		v := *r.RPMRemaining
+		r.RPMRemaining = &v
+	}
+	if r.Unified5hUtil != nil {
+		v := *r.Unified5hUtil
+		r.Unified5hUtil = &v
+	}
+	if r.Unified5hReset != nil {
+		v := *r.Unified5hReset
+		r.Unified5hReset = &v
+	}
+	if r.Unified7dUtil != nil {
+		v := *r.Unified7dUtil
+		r.Unified7dUtil = &v
+	}
+	if r.Unified7dReset != nil {
+		v := *r.Unified7dReset
+		r.Unified7dReset = &v
+	}
+	return r
 }
 
 func (s *Store) AddRecord(rec RequestRecord) {
@@ -65,6 +143,7 @@ func (s *Store) AddRecord(rec RequestRecord) {
 		s.sessions[rec.SessionID] = sess
 	}
 	sess.LastSeen = rec.EndTime
+	rec = deepCopyRecord(rec)
 	sess.Requests = append(sess.Requests, rec)
 	if len(sess.Requests) > 1000 {
 		sess.Requests = sess.Requests[len(sess.Requests)-1000:]
@@ -221,9 +300,12 @@ func (s *Store) GetActiveTime(sessionID string) time.Duration {
 	return sumDurations(merged)
 }
 
-// CalculateTPM returns the TPM for a specific session.
-// Returns 0 if session doesn't exist or has no active time.
-func (s *Store) CalculateTPM(sessionID string) float64 {
+// RollingITPM returns the rolling 60-second ITPM (input tokens per minute) for a session.
+// A record contributes if its EndTime falls in (now-60s, now].
+// ITPM = Σ(InputTokens + CacheCreation) — matches Anthropic's documented ITPM definition.
+// CacheRead is deliberately excluded (modern models do not count it toward ITPM).
+// In-flight requests are excluded because their token counts are not yet known.
+func (s *Store) RollingITPM(sessionID string, now time.Time) float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -231,38 +313,168 @@ func (s *Store) CalculateTPM(sessionID string) float64 {
 	if !ok {
 		return 0
 	}
-
-	intervals := s.collectIntervals(sessionID)
-	merged := mergeIntervals(intervals)
-	activeTime := sumDurations(merged)
-	if activeTime == 0 {
-		return 0
-	}
-
-	var totalTokens int
+	windowStart := now.Add(-60 * time.Second)
+	var total int
 	for _, r := range sess.Requests {
-		totalTokens += r.InputTokens + r.OutputTokens + r.CacheCreation + r.CacheRead
+		if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+			total += r.InputTokens + r.CacheCreation
+		}
 	}
-	return float64(totalTokens) / activeTime.Minutes()
+	return float64(total)
 }
 
-// CalculateAggregateTPM returns the TPM across all sessions.
-func (s *Store) CalculateAggregateTPM() float64 {
+// RollingOTPM returns the rolling 60-second OTPM (output tokens per minute) for a session.
+// Uses end-time attribution. In-flight requests are excluded.
+func (s *Store) RollingOTPM(sessionID string, now time.Time) float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	intervals := s.collectIntervals("")
-	merged := mergeIntervals(intervals)
-	activeTime := sumDurations(merged)
-	if activeTime == 0 {
+	sess, ok := s.sessions[sessionID]
+	if !ok {
 		return 0
 	}
-
-	var totalTokens int
-	for _, sess := range s.sessions {
-		for _, r := range sess.Requests {
-			totalTokens += r.InputTokens + r.OutputTokens + r.CacheCreation + r.CacheRead
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, r := range sess.Requests {
+		if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+			total += r.OutputTokens
 		}
 	}
-	return float64(totalTokens) / activeTime.Minutes()
+	return float64(total)
 }
+
+// RollingRPM returns the rolling 60-second RPM (requests per minute) for a session.
+// Counts all records (including zero-token error responses) whose EndTime falls in the window.
+func (s *Store) RollingRPM(sessionID string, now time.Time) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return 0
+	}
+	windowStart := now.Add(-60 * time.Second)
+	count := 0
+	for _, r := range sess.Requests {
+		if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+			count++
+		}
+	}
+	return count
+}
+
+// RollingAggregateITPM returns rolling 60s ITPM across all sessions in the store.
+func (s *Store) RollingAggregateITPM(now time.Time) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, sess := range s.sessions {
+		for _, r := range sess.Requests {
+			if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+				total += r.InputTokens + r.CacheCreation
+			}
+		}
+	}
+	return float64(total)
+}
+
+// RollingAggregateOTPM returns rolling 60s OTPM across all sessions.
+func (s *Store) RollingAggregateOTPM(now time.Time) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	windowStart := now.Add(-60 * time.Second)
+	var total int
+	for _, sess := range s.sessions {
+		for _, r := range sess.Requests {
+			if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+				total += r.OutputTokens
+			}
+		}
+	}
+	return float64(total)
+}
+
+// RollingAggregateRPM returns rolling 60s RPM across all sessions.
+func (s *Store) RollingAggregateRPM(now time.Time) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	windowStart := now.Add(-60 * time.Second)
+	count := 0
+	for _, sess := range s.sessions {
+		for _, r := range sess.Requests {
+			if r.EndTime.After(windowStart) && !r.EndTime.After(now) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// UpdateSessionPeaks updates the peak ITPM/OTPM/RPM for a session using compare-and-swap logic.
+// Each metric is updated only if the new value exceeds the stored peak.
+// If the session does not exist, this is a no-op.
+func (s *Store) UpdateSessionPeaks(sessionID string, itpm, otpm float64, rpm int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if itpm > sess.Peaks.MaxITPM {
+		sess.Peaks.MaxITPM = itpm
+		sess.Peaks.MaxITPMTime = now
+	}
+	if otpm > sess.Peaks.MaxOTPM {
+		sess.Peaks.MaxOTPM = otpm
+		sess.Peaks.MaxOTPMTime = now
+	}
+	if rpm > sess.Peaks.MaxRPM {
+		sess.Peaks.MaxRPM = rpm
+		sess.Peaks.MaxRPMTime = now
+	}
+}
+
+// GetSessionPeaks returns a snapshot of the peak metrics for a session.
+// Returns zero-value SessionPeaks if the session does not exist.
+func (s *Store) GetSessionPeaks(sessionID string) SessionPeaks {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return SessionPeaks{}
+	}
+	return sess.Peaks
+}
+
+// UpdateAggregatePeaks updates the store-wide peak ITPM/OTPM/RPM using compare-and-swap logic.
+// Each metric is updated only if the new value exceeds the stored aggregate peak.
+func (s *Store) UpdateAggregatePeaks(itpm, otpm float64, rpm int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if itpm > s.aggregatePeaks.MaxITPM {
+		s.aggregatePeaks.MaxITPM = itpm
+		s.aggregatePeaks.MaxITPMTime = now
+	}
+	if otpm > s.aggregatePeaks.MaxOTPM {
+		s.aggregatePeaks.MaxOTPM = otpm
+		s.aggregatePeaks.MaxOTPMTime = now
+	}
+	if rpm > s.aggregatePeaks.MaxRPM {
+		s.aggregatePeaks.MaxRPM = rpm
+		s.aggregatePeaks.MaxRPMTime = now
+	}
+}
+
+// GetAggregatePeaks returns a snapshot of the store-wide peak metrics.
+func (s *Store) GetAggregatePeaks() SessionPeaks {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.aggregatePeaks
+}
+

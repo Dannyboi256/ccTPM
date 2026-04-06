@@ -25,12 +25,15 @@ func main() {
 	upstream := flag.String("upstream", "https://api.anthropic.com", "Upstream API URL")
 	session := flag.String("session", "default", "Session name")
 	dbPath := flag.String("db", defaultDBPath(), "SQLite database path")
-	queryMode := flag.String("query", "", "Query mode: sessions, requests, throttle, summary")
+	queryMode := flag.String("query", "", "Query mode: sessions, requests, throttle, summary, tpm")
 	from := flag.String("from", "", "Start time filter for queries")
 	to := flag.String("to", "", "End time filter for queries")
 	last := flag.String("last", "", "Relative time filter (e.g., 24h, 7d)")
 	ttftThreshold := flag.Int("ttft-threshold", 5000, "TTFT threshold in ms for throttle queries")
-	limit := flag.Int("limit", 10, "Max rows to return in query mode (0 = unlimited)")
+	limit := flag.Int("limit", 0, "Max rows to return in query mode (0 = per-mode default: 10 for most, unlimited for tpm bucketed)")
+	bucket := flag.Int("bucket", 0, "TPM query bucket size in seconds (e.g. 60, 300, 3600). 0 = default 5m")
+	peak := flag.Bool("peak", false, "TPM query peak mode (single-row max)")
+	groupBy := flag.String("group-by", "", "TPM query group-by: 'session' or empty")
 	flag.Parse()
 
 	// Resolve --last to --from
@@ -62,6 +65,9 @@ func main() {
 			TTFTThreshold: *ttftThreshold,
 			Limit:         *limit,
 			SessionID:     sessionFilter,
+			Bucket:        *bucket,
+			Peak:          *peak,
+			GroupBy:       *groupBy,
 		})
 		if err != nil {
 			log.Fatal(err)

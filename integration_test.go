@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"claude-proxy/db"
 	"claude-proxy/proxy"
 	"claude-proxy/store"
 	"compress/gzip"
@@ -247,6 +248,181 @@ func TestProxyHandlesGzipSSEStream(t *testing.T) {
 	}
 
 	close(dbChan)
+}
+
+// setupProxy returns a store, dbChan, db, and httptest proxy server wired to the given upstream.
+func setupProxy(t *testing.T, upstreamURL string) (*store.Store, chan store.RequestRecord, *db.DB, *httptest.Server) {
+	t.Helper()
+	u, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewStore()
+	dbChan := make(chan store.RequestRecord, 64)
+	p := proxy.NewProxy(proxy.Config{
+		UpstreamURL: u,
+		SessionName: "default",
+		Store:       st,
+		DBChan:      dbChan,
+	})
+	srv := httptest.NewServer(p)
+	return st, dbChan, d, srv
+}
+
+func TestIntegration_ProxyCapturesAnthropicRateLimitHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-ratelimit-input-tokens-limit", "450000")
+		w.Header().Set("anthropic-ratelimit-input-tokens-remaining", "448500")
+		w.Header().Set("anthropic-ratelimit-output-tokens-limit", "90000")
+		w.Header().Set("anthropic-ratelimit-output-tokens-remaining", "89200")
+		w.Header().Set("anthropic-ratelimit-requests-remaining", "998")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4","usage":{"input_tokens":100,"output_tokens":20}}`))
+	}))
+	defer upstream.Close()
+
+	st, dbChan, d, proxyServer := setupProxy(t, upstream.URL)
+	defer proxyServer.Close()
+	defer d.Close()
+	_ = st
+
+	resp, err := http.Post(proxyServer.URL+"/v1/messages", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Drain the DB channel for the record
+	var rec store.RequestRecord
+	select {
+	case rec = <-dbChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for record")
+	}
+	if rec.ITokensLimit == nil || *rec.ITokensLimit != 450000 {
+		t.Errorf("ITokensLimit: expected 450000, got %v", rec.ITokensLimit)
+	}
+	if rec.OTokensRemaining == nil || *rec.OTokensRemaining != 89200 {
+		t.Errorf("OTokensRemaining: expected 89200, got %v", rec.OTokensRemaining)
+	}
+
+	// Insert through the db and read back to confirm round-trip
+	if err := d.InsertRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := d.QueryRequests("", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ITokensLimit == nil || *rows[0].ITokensLimit != 450000 {
+		t.Fatal("DB round-trip lost ITokensLimit")
+	}
+}
+
+func TestIntegration_ProxyCapturesUnifiedOAuthHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("anthropic-ratelimit-unified-status", "allowed")
+		w.Header().Set("anthropic-ratelimit-unified-5h-status", "allowed")
+		w.Header().Set("anthropic-ratelimit-unified-5h-utilization", "0.0184169696")
+		w.Header().Set("anthropic-ratelimit-unified-5h-reset", "1712345678")
+		w.Header().Set("anthropic-ratelimit-unified-7d-utilization", "0.7370692663")
+		w.Header().Set("anthropic-ratelimit-unified-representative-claim", "five_hour")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4","usage":{"input_tokens":50,"output_tokens":10}}`))
+	}))
+	defer upstream.Close()
+
+	_, dbChan, d, proxyServer := setupProxy(t, upstream.URL)
+	defer proxyServer.Close()
+	defer d.Close()
+
+	resp, err := http.Post(proxyServer.URL+"/v1/messages", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	var rec store.RequestRecord
+	select {
+	case rec = <-dbChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for record")
+	}
+	if rec.Unified5hUtil == nil || *rec.Unified5hUtil < 0.018 || *rec.Unified5hUtil > 0.019 {
+		t.Errorf("Unified5hUtil wrong: %v", rec.Unified5hUtil)
+	}
+	if rec.UnifiedStatus != "allowed" {
+		t.Errorf("UnifiedStatus wrong: %q", rec.UnifiedStatus)
+	}
+	if rec.UnifiedReprClaim != "five_hour" {
+		t.Errorf("UnifiedReprClaim wrong: %q", rec.UnifiedReprClaim)
+	}
+}
+
+func TestIntegration_EndToEndTPMMeasurement(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":50}}`))
+	}))
+	defer upstream.Close()
+
+	st, dbChan, d, proxyServer := setupProxy(t, upstream.URL)
+	defer proxyServer.Close()
+	defer d.Close()
+
+	// Fire 5 requests
+	for i := 0; i < 5; i++ {
+		resp, err := http.Post(proxyServer.URL+"/v1/messages", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	// Collect records and insert into DB
+	for i := 0; i < 5; i++ {
+		select {
+		case rec := <-dbChan:
+			if err := d.InsertRecord(rec); err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timeout waiting for record %d", i)
+		}
+	}
+
+	// In-memory rolling metrics
+	now := time.Now()
+	itpm := st.RollingITPM("default", now)
+	if itpm < 5*1050 { // 5 * (1000 input + 50 cache_creation)
+		t.Errorf("in-memory ITPM too low: got %v, want at least %v", itpm, 5*1050)
+	}
+
+	// DB TPM bucket should show at least one bucket with the same total
+	buckets, err := d.QueryTPMBuckets(now.Add(-2*time.Minute), now.Add(1*time.Minute), 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) == 0 {
+		t.Fatal("expected at least one bucket, got none")
+	}
+	var sumITPM float64
+	for _, b := range buckets {
+		sumITPM += b.MaxITPM
+	}
+	if sumITPM < 5*1050 {
+		t.Errorf("DB TPM buckets too low: sum %v, want at least %v", sumITPM, 5*1050)
+	}
 }
 
 func TestParseDuration(t *testing.T) {
