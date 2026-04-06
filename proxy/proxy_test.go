@@ -8,6 +8,195 @@ import (
 	"time"
 )
 
+// makeResp returns a minimal *http.Response with the given headers and no body.
+func makeResp(headers map[string]string) *http.Response {
+	h := http.Header{}
+	for k, v := range headers {
+		h.Set(k, v)
+	}
+	return &http.Response{
+		StatusCode: 200,
+		Header:     h,
+		Body:       io.NopCloser(bytes.NewReader(nil)),
+		Request:    &http.Request{Header: http.Header{}},
+	}
+}
+
+func TestExtractRateLimitHeaders_AnthropicPerDirection(t *testing.T) {
+	resp := makeResp(map[string]string{
+		"anthropic-ratelimit-input-tokens-limit":     "450000",
+		"anthropic-ratelimit-input-tokens-remaining": "448500",
+		"anthropic-ratelimit-input-tokens-reset":     "2026-04-05T00:00:00Z",
+		"anthropic-ratelimit-output-tokens-limit":     "16000",
+		"anthropic-ratelimit-output-tokens-remaining": "15000",
+		"anthropic-ratelimit-output-tokens-reset":     "2026-04-05T00:01:00Z",
+		"anthropic-ratelimit-requests-limit":          "1000",
+		"anthropic-ratelimit-requests-remaining":      "998",
+		"anthropic-ratelimit-requests-reset":          "2026-04-05T00:02:00Z",
+		"anthropic-ratelimit-tokens-remaining":        "9999",
+	})
+
+	rl := extractRateLimitHeaders(resp)
+
+	if rl.ITokensLimit == nil || *rl.ITokensLimit != 450000 {
+		t.Fatalf("ITokensLimit: got %v", rl.ITokensLimit)
+	}
+	if rl.ITokensRemaining == nil || *rl.ITokensRemaining != 448500 {
+		t.Fatalf("ITokensRemaining: got %v", rl.ITokensRemaining)
+	}
+	if rl.ITokensReset != "2026-04-05T00:00:00Z" {
+		t.Fatalf("ITokensReset: got %q", rl.ITokensReset)
+	}
+	if rl.OTokensLimit == nil || *rl.OTokensLimit != 16000 {
+		t.Fatalf("OTokensLimit: got %v", rl.OTokensLimit)
+	}
+	if rl.OTokensRemaining == nil || *rl.OTokensRemaining != 15000 {
+		t.Fatalf("OTokensRemaining: got %v", rl.OTokensRemaining)
+	}
+	if rl.RPMLimit == nil || *rl.RPMLimit != 1000 {
+		t.Fatalf("RPMLimit: got %v", rl.RPMLimit)
+	}
+	if rl.RPMRemaining == nil || *rl.RPMRemaining != 998 {
+		t.Fatalf("RPMRemaining: got %v", rl.RPMRemaining)
+	}
+	if rl.LegacyTokensRemaining == nil || *rl.LegacyTokensRemaining != 9999 {
+		t.Fatalf("LegacyTokensRemaining: got %v", rl.LegacyTokensRemaining)
+	}
+}
+
+func TestExtractRateLimitHeaders_UnifiedOAuth(t *testing.T) {
+	resp := makeResp(map[string]string{
+		"anthropic-ratelimit-unified-status":               "allowed",
+		"anthropic-ratelimit-unified-5h-utilization":       "0.0184",
+		"anthropic-ratelimit-unified-5h-reset":             "1743810000",
+		"anthropic-ratelimit-unified-7d-utilization":       "0.0042",
+		"anthropic-ratelimit-unified-7d-reset":             "1744200000",
+		"anthropic-ratelimit-unified-representative-claim": "five_hour",
+	})
+
+	rl := extractRateLimitHeaders(resp)
+
+	if rl.UnifiedStatus != "allowed" {
+		t.Fatalf("UnifiedStatus: got %q", rl.UnifiedStatus)
+	}
+	if rl.Unified5hUtil == nil || *rl.Unified5hUtil < 0.018 || *rl.Unified5hUtil > 0.019 {
+		t.Fatalf("Unified5hUtil: got %v", rl.Unified5hUtil)
+	}
+	if rl.Unified5hReset == nil || *rl.Unified5hReset != 1743810000 {
+		t.Fatalf("Unified5hReset: got %v", rl.Unified5hReset)
+	}
+	if rl.Unified7dUtil == nil || *rl.Unified7dUtil < 0.004 || *rl.Unified7dUtil > 0.005 {
+		t.Fatalf("Unified7dUtil: got %v", rl.Unified7dUtil)
+	}
+	if rl.Unified7dReset == nil || *rl.Unified7dReset != 1744200000 {
+		t.Fatalf("Unified7dReset: got %v", rl.Unified7dReset)
+	}
+	if rl.UnifiedReprClaim != "five_hour" {
+		t.Fatalf("UnifiedReprClaim: got %q", rl.UnifiedReprClaim)
+	}
+}
+
+func TestExtractRateLimitHeaders_BothSetsCoexist(t *testing.T) {
+	resp := makeResp(map[string]string{
+		"anthropic-ratelimit-input-tokens-limit":     "450000",
+		"anthropic-ratelimit-input-tokens-remaining": "440000",
+		"anthropic-ratelimit-unified-status":         "rate_limited",
+		"anthropic-ratelimit-unified-5h-utilization": "0.99",
+	})
+
+	rl := extractRateLimitHeaders(resp)
+
+	if rl.ITokensLimit == nil || *rl.ITokensLimit != 450000 {
+		t.Fatalf("ITokensLimit: got %v", rl.ITokensLimit)
+	}
+	if rl.ITokensRemaining == nil || *rl.ITokensRemaining != 440000 {
+		t.Fatalf("ITokensRemaining: got %v", rl.ITokensRemaining)
+	}
+	if rl.UnifiedStatus != "rate_limited" {
+		t.Fatalf("UnifiedStatus: got %q", rl.UnifiedStatus)
+	}
+	if rl.Unified5hUtil == nil || *rl.Unified5hUtil < 0.98 {
+		t.Fatalf("Unified5hUtil: got %v", rl.Unified5hUtil)
+	}
+}
+
+func TestExtractRateLimitHeaders_AllAbsent(t *testing.T) {
+	resp := makeResp(map[string]string{})
+
+	rl := extractRateLimitHeaders(resp)
+
+	if rl.ITokensLimit != nil {
+		t.Fatalf("ITokensLimit should be nil, got %v", rl.ITokensLimit)
+	}
+	if rl.ITokensRemaining != nil {
+		t.Fatalf("ITokensRemaining should be nil, got %v", rl.ITokensRemaining)
+	}
+	if rl.OTokensLimit != nil {
+		t.Fatalf("OTokensLimit should be nil, got %v", rl.OTokensLimit)
+	}
+	if rl.RPMLimit != nil {
+		t.Fatalf("RPMLimit should be nil, got %v", rl.RPMLimit)
+	}
+	if rl.RPMRemaining != nil {
+		t.Fatalf("RPMRemaining should be nil, got %v", rl.RPMRemaining)
+	}
+	if rl.LegacyTokensRemaining != nil {
+		t.Fatalf("LegacyTokensRemaining should be nil, got %v", rl.LegacyTokensRemaining)
+	}
+	if rl.Unified5hUtil != nil {
+		t.Fatalf("Unified5hUtil should be nil, got %v", rl.Unified5hUtil)
+	}
+	if rl.Unified5hReset != nil {
+		t.Fatalf("Unified5hReset should be nil, got %v", rl.Unified5hReset)
+	}
+	if rl.UnifiedStatus != "" {
+		t.Fatalf("UnifiedStatus should be empty, got %q", rl.UnifiedStatus)
+	}
+	if rl.UnifiedReprClaim != "" {
+		t.Fatalf("UnifiedReprClaim should be empty, got %q", rl.UnifiedReprClaim)
+	}
+	if rl.RetryAfter != "" {
+		t.Fatalf("RetryAfter should be empty, got %q", rl.RetryAfter)
+	}
+}
+
+func TestExtractRateLimitHeaders_MalformedUtilization(t *testing.T) {
+	resp := makeResp(map[string]string{
+		"anthropic-ratelimit-unified-5h-utilization": "not-a-float",
+		"anthropic-ratelimit-unified-5h-reset":       "not-an-int",
+		"anthropic-ratelimit-input-tokens-limit":     "also-bad",
+	})
+
+	rl := extractRateLimitHeaders(resp)
+
+	if rl.Unified5hUtil != nil {
+		t.Fatalf("Unified5hUtil should be nil for malformed value, got %v", rl.Unified5hUtil)
+	}
+	if rl.Unified5hReset != nil {
+		t.Fatalf("Unified5hReset should be nil for malformed value, got %v", rl.Unified5hReset)
+	}
+	if rl.ITokensLimit != nil {
+		t.Fatalf("ITokensLimit should be nil for malformed value, got %v", rl.ITokensLimit)
+	}
+}
+
+func TestExtractRateLimitHeaders_UnifiedResetAsRFC3339(t *testing.T) {
+	// The API might return RFC3339 instead of unix seconds; parseUnixOrRFC3339 should handle it.
+	resp := makeResp(map[string]string{
+		"anthropic-ratelimit-unified-5h-reset": "2026-04-05T00:00:00Z",
+	})
+
+	rl := extractRateLimitHeaders(resp)
+
+	if rl.Unified5hReset == nil {
+		t.Fatal("Unified5hReset should not be nil for RFC3339 value")
+	}
+	// 2026-04-05T00:00:00Z unix = 1775347200
+	if *rl.Unified5hReset != 1775347200 {
+		t.Fatalf("Unified5hReset: got %d, want 1775347200", *rl.Unified5hReset)
+	}
+}
+
 func TestTeeReadCloserForwardsData(t *testing.T) {
 	original := io.NopCloser(bytes.NewReader([]byte("hello world")))
 	ch := make(chan []byte, 64)

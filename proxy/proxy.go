@@ -76,21 +76,108 @@ func ExtractSessionID(headers http.Header, fallback string) string {
 	return fallback
 }
 
-func extractRateLimitHeaders(resp *http.Response) (retryAfter string, reqRemaining, tokRemaining int) {
-	retryAfter = resp.Header.Get("Retry-After")
-	reqRemaining = -1
-	tokRemaining = -1
-	if v := resp.Header.Get("X-Ratelimit-Requests-Remaining"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			reqRemaining = n
-		}
+// RateLimitHeaders holds all rate-limit-related response headers from the Anthropic API.
+type RateLimitHeaders struct {
+	ITokensLimit     *int
+	ITokensRemaining *int
+	ITokensReset     string
+	OTokensLimit     *int
+	OTokensRemaining *int
+	OTokensReset     string
+	RPMLimit         *int
+	RPMRemaining     *int
+	RPMReset         string
+
+	// Legacy combined tokens header
+	LegacyTokensRemaining *int
+
+	// Unified OAuth headers
+	Unified5hUtil    *float64
+	Unified5hReset   *int64
+	Unified5hStatus  string
+	Unified7dUtil    *float64
+	Unified7dReset   *int64
+	Unified7dStatus  string
+	UnifiedStatus    string
+	UnifiedReprClaim string
+
+	RetryAfter string
+}
+
+func parseIntHeader(h http.Header, name string) *int {
+	v := h.Get(name)
+	if v == "" {
+		return nil
 	}
-	if v := resp.Header.Get("X-Ratelimit-Tokens-Remaining"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			tokRemaining = n
-		}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return nil
 	}
-	return
+	return &n
+}
+
+func parseFloatHeader(h http.Header, name string) *float64 {
+	v := h.Get(name)
+	if v == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return nil
+	}
+	return &f
+}
+
+func parseUnixOrRFC3339(h http.Header, name string) *int64 {
+	v := h.Get(name)
+	if v == "" {
+		return nil
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return &n
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		sec := t.Unix()
+		return &sec
+	}
+	return nil
+}
+
+func extractRateLimitHeaders(resp *http.Response) RateLimitHeaders {
+	h := resp.Header
+	var out RateLimitHeaders
+
+	out.RetryAfter = h.Get("Retry-After")
+
+	// Per-direction input token headers
+	out.ITokensLimit = parseIntHeader(h, "anthropic-ratelimit-input-tokens-limit")
+	out.ITokensRemaining = parseIntHeader(h, "anthropic-ratelimit-input-tokens-remaining")
+	out.ITokensReset = h.Get("anthropic-ratelimit-input-tokens-reset")
+
+	// Per-direction output token headers
+	out.OTokensLimit = parseIntHeader(h, "anthropic-ratelimit-output-tokens-limit")
+	out.OTokensRemaining = parseIntHeader(h, "anthropic-ratelimit-output-tokens-remaining")
+	out.OTokensReset = h.Get("anthropic-ratelimit-output-tokens-reset")
+
+	// Requests (RPM) headers
+	out.RPMLimit = parseIntHeader(h, "anthropic-ratelimit-requests-limit")
+	out.RPMRemaining = parseIntHeader(h, "anthropic-ratelimit-requests-remaining")
+	out.RPMReset = h.Get("anthropic-ratelimit-requests-reset")
+
+	// Legacy combined tokens header — distinct from ITokensRemaining, do not conflate
+	out.LegacyTokensRemaining = parseIntHeader(h, "anthropic-ratelimit-tokens-remaining")
+
+	// Unified OAuth headers
+	out.Unified5hUtil = parseFloatHeader(h, "anthropic-ratelimit-unified-5h-utilization")
+	out.Unified5hReset = parseUnixOrRFC3339(h, "anthropic-ratelimit-unified-5h-reset")
+	out.Unified5hStatus = h.Get("anthropic-ratelimit-unified-5h-status")
+	out.Unified7dUtil = parseFloatHeader(h, "anthropic-ratelimit-unified-7d-utilization")
+	out.Unified7dReset = parseUnixOrRFC3339(h, "anthropic-ratelimit-unified-7d-reset")
+	out.Unified7dStatus = h.Get("anthropic-ratelimit-unified-7d-status")
+	out.UnifiedStatus = h.Get("anthropic-ratelimit-unified-status")
+	out.UnifiedReprClaim = h.Get("anthropic-ratelimit-unified-representative-claim")
+
+	return out
 }
 
 type Config struct {
@@ -125,7 +212,16 @@ func modifyResponse(resp *http.Response, cfg Config) error {
 	if requestStart.IsZero() {
 		requestStart = time.Now()
 	}
-	retryAfter, reqRemaining, tokRemaining := extractRateLimitHeaders(resp)
+	rateHeaders := extractRateLimitHeaders(resp)
+	retryAfter := rateHeaders.RetryAfter
+	reqRemaining := -1
+	if rateHeaders.RPMRemaining != nil {
+		reqRemaining = *rateHeaders.RPMRemaining
+	}
+	tokRemaining := -1
+	if rateHeaders.LegacyTokensRemaining != nil {
+		tokRemaining = *rateHeaders.LegacyTokensRemaining
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		rec := store.RequestRecord{
