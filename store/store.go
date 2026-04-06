@@ -48,11 +48,21 @@ type RequestRecord struct {
 	UnifiedReprClaim string // e.g., "five_hour"
 }
 
+type SessionPeaks struct {
+	MaxITPM     float64
+	MaxITPMTime time.Time
+	MaxOTPM     float64
+	MaxOTPMTime time.Time
+	MaxRPM      int
+	MaxRPMTime  time.Time
+}
+
 type Session struct {
 	ID        string
 	StartTime time.Time
 	LastSeen  time.Time
 	Requests  []RequestRecord
+	Peaks     SessionPeaks
 }
 
 type InFlightReq struct {
@@ -381,6 +391,44 @@ func (s *Store) RollingAggregateRPM(now time.Time) int {
 		}
 	}
 	return count
+}
+
+// UpdateSessionPeaks updates the peak ITPM/OTPM/RPM for a session using compare-and-swap logic.
+// Each metric is updated only if the new value exceeds the stored peak.
+// If the session does not exist, this is a no-op.
+func (s *Store) UpdateSessionPeaks(sessionID string, itpm, otpm float64, rpm int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if itpm > sess.Peaks.MaxITPM {
+		sess.Peaks.MaxITPM = itpm
+		sess.Peaks.MaxITPMTime = now
+	}
+	if otpm > sess.Peaks.MaxOTPM {
+		sess.Peaks.MaxOTPM = otpm
+		sess.Peaks.MaxOTPMTime = now
+	}
+	if rpm > sess.Peaks.MaxRPM {
+		sess.Peaks.MaxRPM = rpm
+		sess.Peaks.MaxRPMTime = now
+	}
+}
+
+// GetSessionPeaks returns a snapshot of the peak metrics for a session.
+// Returns zero-value SessionPeaks if the session does not exist.
+func (s *Store) GetSessionPeaks(sessionID string) SessionPeaks {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return SessionPeaks{}
+	}
+	return sess.Peaks
 }
 
 // CalculateAggregateTPM returns the TPM across all sessions.

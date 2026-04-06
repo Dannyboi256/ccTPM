@@ -532,6 +532,53 @@ func TestRollingAggregateRPM(t *testing.T) {
 	}
 }
 
+func TestSessionPeaks_UpdateOnIncrease(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(withSession("s1"), withEndTime(now)))
+
+	s.UpdateSessionPeaks("s1", 100, 20, 3, now)
+	peaks := s.GetSessionPeaks("s1")
+	if peaks.MaxITPM != 100 || peaks.MaxOTPM != 20 || peaks.MaxRPM != 3 {
+		t.Fatalf("expected (100,20,3), got (%v,%v,%d)", peaks.MaxITPM, peaks.MaxOTPM, peaks.MaxRPM)
+	}
+
+	later := now.Add(time.Second)
+	s.UpdateSessionPeaks("s1", 250, 10, 2, later)
+	peaks = s.GetSessionPeaks("s1")
+	if peaks.MaxITPM != 250 {
+		t.Fatalf("expected MaxITPM=250, got %v", peaks.MaxITPM)
+	}
+	if !peaks.MaxITPMTime.Equal(later) {
+		t.Fatalf("expected MaxITPMTime=%v, got %v", later, peaks.MaxITPMTime)
+	}
+	if peaks.MaxOTPM != 20 {
+		t.Fatalf("expected MaxOTPM=20 (unchanged), got %v", peaks.MaxOTPM)
+	}
+}
+
+func TestSessionPeaks_PersistAcrossQuiet(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.AddRecord(newTestRecord(withSession("s1"), withEndTime(now)))
+
+	s.UpdateSessionPeaks("s1", 500, 100, 10, now)
+	s.UpdateSessionPeaks("s1", 0, 0, 0, now.Add(10*time.Second))
+
+	peaks := s.GetSessionPeaks("s1")
+	if peaks.MaxITPM != 500 || peaks.MaxOTPM != 100 || peaks.MaxRPM != 10 {
+		t.Fatalf("peaks should persist after quiet period, got %+v", peaks)
+	}
+}
+
+func TestSessionPeaks_NonexistentSession(t *testing.T) {
+	s := NewStore()
+	peaks := s.GetSessionPeaks("nope")
+	if peaks.MaxITPM != 0 || peaks.MaxOTPM != 0 || peaks.MaxRPM != 0 {
+		t.Fatalf("expected zero peaks for nonexistent session, got %+v", peaks)
+	}
+}
+
 func TestGetActiveTime(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
